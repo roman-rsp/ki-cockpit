@@ -4,7 +4,7 @@ import requests
 # --- KONFIGURATION ---
 # Das hier ist die Adresse, an die dein Chat die Nachrichten schickt.
 # Wir müssen diesen Link später noch durch deinen ECHTEN n8n-Link ersetzen.
-N8N_WEBHOOK_URL = "https://DEIN-N8N-SERVER.elestio.app/webhook/cockpit-chat"
+N8N_WEBHOOK_URL = "https://n8n-f8jg4-u44283.vm.elestio.app/webhook/cockpit-chat"
 
 # --- SEITEN-LAYOUT ---
 st.set_page_config(page_title="KI Entwickler-Studio", layout="wide")
