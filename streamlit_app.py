@@ -25,7 +25,7 @@ with st.sidebar:
     # 2. KI-Modell Auswahl (Die Weiche)
     selected_model = st.selectbox(
         "KI-Modell wählen:",
-        ["gpt-4o-mini (Schnell & Günstig)", "gpt-4o (Der Denker)", "gemini-1.5-pro (Google)"]
+        ["gpt-4o-mini (Schnell & Günstig)", "gpt-4o (Der Denker)", "gemini-2.5-pro (Google)"]]
     )
 
     st.divider()
