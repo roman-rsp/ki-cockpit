@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import base64
 
 # --- KONFIGURATION ---
 N8N_WEBHOOK_URL = "https://n8n-f8jg4-u44283.vm.elestio.app/webhook/cockpit-chat"
@@ -32,7 +33,7 @@ with st.sidebar:
     st.subheader("🎯 Master-Plan (Ziel)")
     master_prompt = st.text_area(
         "Projekt-Ziel:",
-        value="Beispiel: Erstelle ein InDesign Script für Version 2024...",
+        value="Analysiere das Bild professionell und beschreibe es detailliert.",
         height=150
     )
 
@@ -48,6 +49,16 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+# --- BILDUPLOAD ---
+uploaded_file = st.file_uploader(
+    "📸 Bild hochladen (optional – für Bildanalyse)",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=False
+)
+
+if uploaded_file:
+    st.image(uploaded_file, caption="Hochgeladenes Bild", use_column_width=True)
+
 # --- CHAT INPUT ---
 if prompt := st.chat_input("Was möchtest du tun?"):
 
@@ -55,6 +66,15 @@ if prompt := st.chat_input("Was möchtest du tun?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
+
+    # --- BILD VERARBEITEN ---
+    image_base64 = None
+    image_name = None
+
+    if uploaded_file:
+        image_bytes = uploaded_file.read()
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_name = uploaded_file.name
 
     # ASSISTENT
     with st.chat_message("assistant"):
@@ -67,13 +87,15 @@ if prompt := st.chat_input("Was möchtest du tun?"):
                 "project": selected_project,
                 "model": selected_model,
                 "master_prompt": master_prompt,
-                "history": st.session_state.messages[:-1]
+                "history": st.session_state.messages[:-1],
+                "image": image_base64,
+                "image_name": image_name
             }
 
             response = requests.post(
                 N8N_WEBHOOK_URL,
                 json=payload,
-                timeout=30
+                timeout=60
             )
 
             if response.status_code == 200:
@@ -83,17 +105,15 @@ if prompt := st.chat_input("Was möchtest du tun?"):
                 if isinstance(data, list) and len(data) > 0:
                     data = data[0]
 
-                # ✅ Beide Varianten abfangen
+                # ✅ Ergebnis extrahieren
                 answer = str(
-                    data.get("output") or
-                    data.get("ki_answer") or
-                    ""
+                    data.get("output") or data.get("ki_answer") or ""
                 ).strip()
 
                 if not answer:
                     answer = "⚠️ n8n hat geantwortet, aber ohne Inhalt."
 
-                # 🧪 Debug (nur falls nötig)
+                # 🔍 Debug (optional)
                 # st.json(data)
 
             else:
