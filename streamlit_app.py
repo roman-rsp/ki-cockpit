@@ -43,7 +43,7 @@ with st.sidebar:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- CHAT VERLAUF ANZEIGEN ---
+# --- CHAT VERLAUF ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -51,7 +51,7 @@ for msg in st.session_state.messages:
 # --- CHAT INPUT ---
 if prompt := st.chat_input("Was möchtest du tun?"):
 
-    # USER NACHRICHT
+    # USER-NACHRICHT
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -79,13 +79,17 @@ if prompt := st.chat_input("Was möchtest du tun?"):
             if response.status_code == 200:
                 data = response.json()
 
-                # ✅ HIER IST DER WICHTIGE FIX:
+                # ✅ n8n kann LIST oder OBJECT liefern
+                if isinstance(data, list) and len(data) > 0:
+                    data = data[0]
+
+                # ✅ Sichere Extraktion
                 answer = str(data.get("output", "")).strip()
 
                 if not answer:
                     answer = "⚠️ n8n hat geantwortet, aber ohne Inhalt."
 
-                # 🧪 DEBUG (optional – nur einmal benutzen)
+                # 🧪 DEBUG (wenn benötigt)
                 # st.json(data)
 
             else:
