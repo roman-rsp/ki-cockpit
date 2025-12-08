@@ -39,7 +39,7 @@ with st.sidebar:
     if st.button("💾 Master-Plan speichern"):
         st.success("Master-Plan gespeichert")
 
-# --- SESSION STATE ---
+# --- SESSION-STATE ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -56,7 +56,7 @@ if prompt := st.chat_input("Was möchtest du tun?"):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # ASSISTENT ANTWORT
+    # ASSISTENT
     with st.chat_message("assistant"):
         placeholder = st.empty()
         placeholder.markdown("⏳ *Verbinde mit n8n...*")
@@ -79,27 +79,31 @@ if prompt := st.chat_input("Was möchtest du tun?"):
             if response.status_code == 200:
                 data = response.json()
 
-                # ✅ n8n kann LIST oder OBJECT liefern
+                # ✅ Falls n8n LIST statt OBJECT liefert
                 if isinstance(data, list) and len(data) > 0:
                     data = data[0]
 
-                # ✅ Sichere Extraktion
-                answer = str(data.get("output", "")).strip()
+                # ✅ Beide Varianten abfangen
+                answer = str(
+                    data.get("output") or
+                    data.get("ki_answer") or
+                    ""
+                ).strip()
 
                 if not answer:
                     answer = "⚠️ n8n hat geantwortet, aber ohne Inhalt."
 
-                # 🧪 DEBUG (wenn benötigt)
+                # 🧪 Debug (nur falls nötig)
                 # st.json(data)
 
             else:
                 answer = f"❌ n8n meldet Fehler {response.status_code}"
 
         except requests.exceptions.Timeout:
-            answer = "⌛ n8n antwortet nicht (Timeout)."
+            answer = "⌛ Timeout: n8n antwortet nicht."
 
         except Exception as e:
-            answer = f"🚨 Verbindungsfehler:\n\n{str(e)}"
+            answer = f"🚨 Fehler:\n\n{str(e)}"
 
         # ANTWORT ANZEIGEN
         placeholder.markdown(answer)
