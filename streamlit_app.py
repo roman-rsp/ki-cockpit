@@ -1,11 +1,12 @@
 import streamlit as st
 import requests
+import json
 
 # -----------------------
 # KONFIGURATION
 # -----------------------
 
-N8N_WEBHOOK_URL = "https://DEINE-N8N-URL/webhook/ki"
+N8N_WEBHOOK_URL = "https://n8n-f8jg4-u44283.vm.elestio.app/webhook/cockpit-chat"
 
 st.set_page_config(page_title="KI Cockpit", layout="wide")
 
@@ -101,7 +102,8 @@ if prompt:
                     "message": prompt,
                     "project": project,
                     "model": model,
-                    "master_prompt": master_prompt
+                    "master_prompt": master_prompt,
+                    "history": json.dumps(st.session_state.messages[-5:]),
                 }
 
                 response = requests.post(
@@ -119,7 +121,8 @@ if prompt:
                     "message": prompt,
                     "project": project,
                     "model": model,
-                    "master_prompt": master_prompt
+                    "master_prompt": master_prompt,
+                    "history": st.session_state.messages[-5:],
                 }
 
                 response = requests.post(
@@ -141,7 +144,6 @@ if prompt:
 
                 if not answer:
                     answer = "⚠️ n8n hat geantwortet, aber ohne Inhalt."
-
             else:
                 answer = f"❌ Serverfehler {response.status_code}"
 
