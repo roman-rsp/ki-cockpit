@@ -91,7 +91,7 @@ if prompt:
             # -------------------------------
             if uploaded_file:
                 files = {
-                    "image": (
+                    "data": (
                         uploaded_file.name,
                         uploaded_file.getvalue(),
                         uploaded_file.type
