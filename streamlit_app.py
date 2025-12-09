@@ -10,14 +10,12 @@ N8N_WEBHOOK_URL = "https://n8n-f8jg4-u44283.vm.elestio.app/webhook/cockpit-chat"
 
 st.set_page_config(page_title="KI Cockpit", layout="wide")
 
-
 # -----------------------
 # SESSION INIT
 # -----------------------
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
 
 # -----------------------
 # SIDEBAR
@@ -37,23 +35,20 @@ master_prompt = st.sidebar.text_area(
     value="Analysiere das Bild professionell und beschreibe es detailliert."
 )
 
-
 # -----------------------
 # HEADER
 # -----------------------
 
 st.title("🧠 KI Cockpit")
-st.caption("Text & Bildanalyse mit stabiler Upload-API (Variante B)")
-
+st.caption("Text & Bildanalyse über n8n mit korrektem Image-Upload")
 
 # -----------------------
-# CHAT HISTORY RENDERING
+# CHAT HISTORY
 # -----------------------
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-
 
 # -----------------------
 # USER INPUT
@@ -69,13 +64,12 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
     st.image(uploaded_file, caption="Vorschau", use_column_width=True)
 
-
 # -----------------------
 # SEND REQUEST
 # -----------------------
 
 if prompt:
-    # Nutzer‐Nachricht speichern
+    # Nutzerpunkt speichern
     st.session_state.messages.append({
         "role": "user",
         "content": prompt
@@ -83,11 +77,11 @@ if prompt:
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
-        placeholder.markdown("⏳ **Verbinde mit n8n...**")
+        placeholder.markdown("⏳ **Sende zu n8n...**")
 
         try:
             # -------------------------------
-            # FALL A: MIT BILD (MULTIPART)
+            # FALL A: MIT BILD (Echte Datei)
             # -------------------------------
             if uploaded_file:
                 files = {
@@ -98,23 +92,23 @@ if prompt:
                     )
                 }
 
-                data = {
+                payload = {
                     "message": prompt,
                     "project": project,
                     "model": model,
                     "master_prompt": master_prompt,
-                    "history": json.dumps(st.session_state.messages[-5:]),
+                    "history": json.dumps(st.session_state.messages[-5:])
                 }
 
                 response = requests.post(
                     N8N_WEBHOOK_URL,
-                    data=data,
                     files=files,
+                    data=payload,
                     timeout=60
                 )
 
             # -------------------------------
-            # FALL B: TEXT ONLY
+            # FALL B: OHNE BILD (JSON)
             # -------------------------------
             else:
                 payload = {
@@ -122,28 +116,32 @@ if prompt:
                     "project": project,
                     "model": model,
                     "master_prompt": master_prompt,
-                    "history": st.session_state.messages[-5:],
+                    "history": st.session_state.messages[-5:]
+                }
+
+                headers = {
+                    "Content-Type": "application/json"
                 }
 
                 response = requests.post(
                     N8N_WEBHOOK_URL,
                     json=payload,
+                    headers=headers,
                     timeout=60
                 )
 
             # -------------------------------
-            # RESPONSE OK
+            # RESPONSE VERARBEITEN
             # -------------------------------
             if response.status_code == 200:
                 data = response.json()
-
-                if isinstance(data, list) and len(data) > 0:
+                if isinstance(data, list) and data:
                     data = data[0]
 
-                answer = data.get("output") or data.get("KI_answer")
+                answer = data.get("answer") or data.get("output") or data.get("KI_answer")
 
                 if not answer:
-                    answer = "⚠️ n8n hat geantwortet, aber ohne Inhalt."
+                    answer = "⚠️ n8n hat geantwortet, aber ohne Antwortinhalt."
             else:
                 answer = f"❌ Serverfehler {response.status_code}"
 
@@ -156,6 +154,7 @@ if prompt:
         # -------------------------------
         # AUSGABE
         # -------------------------------
+
         placeholder.markdown(answer)
 
         st.session_state.messages.append({
