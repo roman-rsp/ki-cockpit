@@ -1,80 +1,75 @@
 import streamlit as st
 import requests
 import base64
-from typing import Any, Dict, List, Optional
 
 # -----------------------
 # KONFIGURATION
 # -----------------------
 N8N_WEBHOOK_URL = "https://n8n-f8jg4-u44283.vm.elestio.app/webhook/cockpit-chat"
-TIMEOUT_SECONDS = 60
-HISTORY_LIMIT = 12  # genug Kontext fürs Testen, nicht zu groß
 
 st.set_page_config(page_title="KI Cockpit", layout="wide")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-if "last_response_meta" not in st.session_state:
-    st.session_state.last_response_meta = {}
 
 # -----------------------
-# HELPER
+# HELPER: Antwort robust extrahieren
 # -----------------------
-def to_base64(file) -> Dict[str, str]:
-    image_bytes = file.getvalue()
-    return {
-        "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
-        "image_mime": file.type,
-        "image_name": file.name,
-    }
-
-def normalize_history(messages: List[Dict[str, str]], limit: int) -> List[Dict[str, str]]:
-    # Nur role/content, nur user/assistant, leere Inhalte raus
-    cleaned = []
-    for m in messages:
-        role = (m.get("role") or "").strip()
-        content = (m.get("content") or "").strip()
-        if role in ("user", "assistant") and content:
-            cleaned.append({"role": role, "content": content})
-    return cleaned[-limit:]
-
-def pick_answer(data: Any) -> str:
+def extract_text(data) -> str:
     """
-    Erwartet entweder dict oder list[dict].
-    Rückgabe: bestmöglicher Antworttext.
+    Robust: unterstützt verschiedene Response-Formate.
+    Priorität: output / KI_answer / content / OpenAI raw_response.output[].content[].text
+    """
+    if isinstance(data, list) and data:
+        data = data[0]
+
+    if not isinstance(data, dict):
+        return ""
+
+    # 1) Direkte Felder (dein Normalize Response liefert aktuell: content)
+    for key in ("output", "KI_answer", "content"):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # 2) OpenAI Responses API (Fallback)
+    rr = data.get("raw_response") or {}
+    try:
+        out = rr.get("output", [])
+        for item in out:
+            # typischerweise: item["content"] ist Liste mit {"type":"output_text","text":"..."}
+            parts = item.get("content", [])
+            for p in parts:
+                if p.get("type") == "output_text" and isinstance(p.get("text"), str):
+                    txt = p["text"].strip()
+                    if txt:
+                        return txt
+    except Exception:
+        pass
+
+    return ""
+
+
+def extract_debug(data) -> dict:
+    """
+    Kleine Debug-Zusammenfassung fürs UI (wenn Debug-Switch aktiv ist).
+    Keine Secrets, nur Meta.
     """
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
-        return "⚠️ Unerwartetes Response-Format."
-
-    # Häufigste Felder, absteigend nach Priorität
-    for key in ("output", "content", "ki_answer", "KI_answer", "answer", "text"):
-        val = data.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    # Falls n8n “raw_response” mitliefert: nicht alles dumpen, nur Hinweis
-    if data.get("raw_response") is not None:
-        return "⚠️ Antwort leer, aber raw_response vorhanden (Debug aktivieren)."
-
-    return "⚠️ Antwort leer."
-
-def extract_meta(data: Any, status_code: int) -> Dict[str, Any]:
-    if isinstance(data, list) and data:
-        data = data[0]
-    if not isinstance(data, dict):
-        return {"status_code": status_code}
+        return {"type": str(type(data))}
 
     return {
-        "status_code": status_code,
-        "provider": data.get("provider") or data.get("model_provider"),
+        "provider": data.get("provider"),
         "model": data.get("model"),
+        "role": data.get("role"),
+        "has_raw_response": bool(data.get("raw_response")),
+        "keys": sorted(list(data.keys()))[:25],
         "error": data.get("error"),
-        "usage": data.get("usage"),
-        "id": (data.get("raw_response") or {}).get("id") if isinstance(data.get("raw_response"), dict) else data.get("id"),
     }
+
 
 # -----------------------
 # SIDEBAR
@@ -83,25 +78,17 @@ st.sidebar.title("Projekte")
 
 project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 
-# Saubere Modellwerte: echte Strings, die dein Router sicher unterscheiden kann
 model = st.sidebar.selectbox(
     "KI-Modell",
-    [
-        "gpt-4o-mini",
-        "gpt-4.1",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro",
-    ],
-    index=0,
+    ["gpt-4o-mini", "gpt-4.1", "gemini"],
 )
 
 master_prompt = st.sidebar.text_area(
     "Master-Plan",
     value="Analysiere das Bild professionell.",
-    height=120,
 )
 
-show_debug = st.sidebar.toggle("Debug anzeigen", value=False)
+debug_mode = st.sidebar.toggle("Debug anzeigen", value=False)
 
 # -----------------------
 # HEADER
@@ -109,10 +96,9 @@ show_debug = st.sidebar.toggle("Debug anzeigen", value=False)
 st.title("🧠 KI Cockpit")
 
 # -----------------------
-# UPLOAD (oben, damit klar ist: optional)
+# UPLOAD
 # -----------------------
 uploaded_file = st.file_uploader("Bild hochladen (optional)", type=["png", "jpg", "jpeg"])
-
 if uploaded_file:
     st.image(uploaded_file, caption="Vorschau", use_column_width=True)
 
@@ -129,65 +115,49 @@ prompt = st.chat_input("Deine Nachricht …")
 # SEND
 # -----------------------
 if prompt:
-    prompt = prompt.strip()
-    if prompt:
-        # 1) User message speichern (UI)
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # User Message im UI speichern
+    st.session_state.messages.append({"role": "user", "content": prompt})
 
-        # 2) Payload bauen
-        payload: Dict[str, Any] = {
-            "message": prompt,
-            "project": project,
-            "model": model,
-            "master_prompt": master_prompt,
-            "history": normalize_history(st.session_state.messages, HISTORY_LIMIT),
-            # Optional: Module-Flagging für dein n8n-Konzept
-            "active_modules": ["n8n", "openai_vision" if model.startswith("gpt") else "gemini"],
-        }
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        placeholder.markdown("⏳ sende…")
 
-        if uploaded_file:
-            payload.update(to_base64(uploaded_file))
-        else:
-            payload["image_base64"] = None
+        try:
+            payload = {
+                "message": prompt,
+                "project": project,
+                "model": model,
+                "master_prompt": master_prompt,
+                # letzte 5 Messages (inkl. user gerade) – wenn du NUR vorherige willst: [-6:-1]
+                "history": st.session_state.messages[-5:],
+            }
 
-        # 3) Request ausführen + UI-Feedback
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            placeholder.markdown("⏳ sende…")
+            # ✅ Bild als Base64
+            if uploaded_file:
+                image_bytes = uploaded_file.getvalue()
+                payload["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
+                payload["image_mime"] = uploaded_file.type
+                payload["image_name"] = uploaded_file.name
 
-            try:
-                resp = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=TIMEOUT_SECONDS)
-                status = resp.status_code
+            response = requests.post(
+                N8N_WEBHOOK_URL,
+                json=payload,
+                timeout=60,
+            )
 
-                if status == 200:
-                    data = resp.json()
-                    answer = pick_answer(data)
-                    st.session_state.last_response_meta = extract_meta(data, status)
-                else:
-                    answer = f"❌ Fehler {status}: {resp.text[:300]}"
-                    st.session_state.last_response_meta = {"status_code": status, "error": resp.text[:500]}
+            if response.status_code == 200:
+                data = response.json()
+                answer = extract_text(data) or "⚠️ Antwort leer."
 
-            except Exception as e:
-                answer = f"⚠️ Exception: {e}"
-                st.session_state.last_response_meta = {"status_code": None, "error": str(e)}
+                if debug_mode:
+                    st.caption("Debug (Response-Meta):")
+                    st.json(extract_debug(data))
+            else:
+                # Response-Body anzeigen hilft sofort beim Diagnostizieren
+                answer = f"❌ Fehler {response.status_code}: {response.text}"
 
-            placeholder.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
+        except Exception as e:
+            answer = f"⚠️ Exception: {e}"
 
-        # Optional: Nach dem Senden Upload “lösen” (Streamlit kann uploader nicht direkt resetten)
-        # -> pragmatisch: Hinweis + ggf. in UI "neues Bild" wählen
-
-# -----------------------
-# DEBUG PANEL
-# -----------------------
-if show_debug:
-    st.divider()
-    st.subheader("Debug")
-    st.json(
-        {
-            "webhook": N8N_WEBHOOK_URL,
-            "selected_model": model,
-            "project": project,
-            "last_response_meta": st.session_state.last_response_meta,
-        }
-    )
+        placeholder.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
