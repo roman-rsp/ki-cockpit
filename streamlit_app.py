@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import base64
+import uuid
 
 # -----------------------
 # KONFIGURATION
@@ -27,7 +28,7 @@ def extract_text(data) -> str:
     if not isinstance(data, dict):
         return ""
 
-    # 1) Direkte Felder (dein Normalize Response liefert aktuell: content)
+    # 1) Direkte Felder
     for key in ("output", "KI_answer", "content"):
         v = data.get(key)
         if isinstance(v, str) and v.strip():
@@ -38,7 +39,6 @@ def extract_text(data) -> str:
     try:
         out = rr.get("output", [])
         for item in out:
-            # typischerweise: item["content"] ist Liste mit {"type":"output_text","text":"..."}
             parts = item.get("content", [])
             for p in parts:
                 if p.get("type") == "output_text" and isinstance(p.get("text"), str):
@@ -80,7 +80,8 @@ project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 
 model = st.sidebar.selectbox(
     "KI-Modell",
-    ["gpt-4o-mini", "gpt-4.1", "gemini"],
+    # Empfehlung: Gemini als konkretes Modell wählen (Routing wird einfacher)
+    ["gpt-4o-mini", "gpt-4.1", "gemini-1.5-flash"],
 )
 
 master_prompt = st.sidebar.text_area(
@@ -123,16 +124,18 @@ if prompt:
         placeholder.markdown("⏳ sende…")
 
         try:
+            request_id = str(uuid.uuid4())
+
+            # ✅ Minimales, stabiles Payload: KEINE history vom Client
             payload = {
+                "request_id": request_id,
                 "message": prompt,
                 "project": project,
                 "model": model,
                 "master_prompt": master_prompt,
-                # letzte 5 Messages (inkl. user gerade) – wenn du NUR vorherige willst: [-6:-1]
-                "history": st.session_state.messages[-5:],
             }
 
-            # ✅ Bild als Base64
+            # ✅ Bild als Base64 (optional)
             if uploaded_file:
                 image_bytes = uploaded_file.getvalue()
                 payload["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
@@ -142,6 +145,7 @@ if prompt:
             response = requests.post(
                 N8N_WEBHOOK_URL,
                 json=payload,
+                headers={"X-Request-Id": request_id},
                 timeout=60,
             )
 
@@ -153,7 +157,6 @@ if prompt:
                     st.caption("Debug (Response-Meta):")
                     st.json(extract_debug(data))
             else:
-                # Response-Body anzeigen hilft sofort beim Diagnostizieren
                 answer = f"❌ Fehler {response.status_code}: {response.text}"
 
         except Exception as e:
