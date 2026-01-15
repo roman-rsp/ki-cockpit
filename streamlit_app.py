@@ -10,8 +10,28 @@ N8N_WEBHOOK_URL = "https://n8n-f8jg4-u44283.vm.elestio.app/webhook/cockpit-chat"
 
 st.set_page_config(page_title="KI Cockpit", layout="wide")
 
+# -----------------------
+# SESSION STATE DEFAULTS
+# -----------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+# Pending-Mechanik, damit die User-Nachricht sofort sichtbar wird
+# und der Request erst im nächsten Run sauber ausgeführt wird.
+if "pending_payload" not in st.session_state:
+    st.session_state.pending_payload = None
+
+
+# -----------------------
+# HELPER: Nachrichten sauber hinzufügen (ohne append)
+# -----------------------
+def add_message(role: str, content: str, meta: dict | None = None):
+    st.session_state.messages = st.session_state.messages + [{
+        "id": str(uuid.uuid4()),
+        "role": role,
+        "content": content,
+        "meta": meta or {},
+    }]
 
 
 # -----------------------
@@ -53,7 +73,7 @@ def extract_text(data) -> str:
 
 def extract_debug(data) -> dict:
     """
-    Kleine Debug-Zusammenfassung fürs UI (wenn Debug-Switch aktiv ist).
+    Kleine Debug-Zusammenfassung fürs UI.
     Keine Secrets, nur Meta.
     """
     if isinstance(data, list) and data:
@@ -66,8 +86,10 @@ def extract_debug(data) -> dict:
         "model": data.get("model"),
         "role": data.get("role"),
         "has_raw_response": bool(data.get("raw_response")),
-        "keys": sorted(list(data.keys()))[:25],
+        "keys": sorted(list(data.keys()))[:50],
         "error": data.get("error"),
+        "project_id": data.get("project_id"),
+        "request_id": data.get("request_id"),
     }
 
 
@@ -80,7 +102,6 @@ project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 
 model = st.sidebar.selectbox(
     "KI-Modell",
-    # Empfehlung: Gemini als konkretes Modell wählen (Routing wird einfacher)
     ["gpt-4o-mini", "gpt-4.1", "gemini-1.5-flash"],
 )
 
@@ -104,63 +125,84 @@ if uploaded_file:
     st.image(uploaded_file, caption="Vorschau", use_column_width=True)
 
 # -----------------------
-# CHAT RENDER
+# CHAT RENDER (immer aus session_state)
 # -----------------------
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+        # Debug pro Assistant-Message (wenn vorhanden)
+        if debug_mode and msg["role"] == "assistant":
+            meta = msg.get("meta") or {}
+            if meta:
+                st.caption("Debug (Response-Meta):")
+                st.json(meta)
+
+# -----------------------
+# INPUT
+# -----------------------
 prompt = st.chat_input("Deine Nachricht …")
 
 # -----------------------
-# SEND
+# 1) USER-EINGABE: sofort speichern + Request für nächsten Run vorbereiten
 # -----------------------
 if prompt:
-    # User Message im UI speichern
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    request_id = str(uuid.uuid4())
 
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        placeholder.markdown("⏳ sende…")
+    # User Message sofort in Chat-Historie (damit sie direkt sichtbar wird)
+    add_message("user", prompt)
 
-        try:
-            request_id = str(uuid.uuid4())
+    # Payload vorbereiten (wird im nächsten Run verarbeitet)
+    payload = {
+        "request_id": request_id,
+        "message": prompt,
+        "project": project,
+        "model": model,
+        "master_prompt": master_prompt,
+    }
 
-            # ✅ Minimales, stabiles Payload: KEINE history vom Client
-            payload = {
-                "request_id": request_id,
-                "message": prompt,
-                "project": project,
-                "model": model,
-                "master_prompt": master_prompt,
-            }
+    # Optionales Bild
+    if uploaded_file:
+        image_bytes = uploaded_file.getvalue()
+        payload["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
+        payload["image_mime"] = uploaded_file.type
+        payload["image_name"] = uploaded_file.name
 
-            # ✅ Bild als Base64 (optional)
-            if uploaded_file:
-                image_bytes = uploaded_file.getvalue()
-                payload["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
-                payload["image_mime"] = uploaded_file.type
-                payload["image_name"] = uploaded_file.name
+    st.session_state.pending_payload = payload
 
-            response = requests.post(
-                N8N_WEBHOOK_URL,
-                json=payload,
-                headers={"X-Request-Id": request_id},
-                timeout=60,
-            )
+    # Wichtig: sofort neu rendern, damit die User-Frage ohne Debug-Toggle sichtbar ist
+    st.rerun()
 
-            if response.status_code == 200:
-                data = response.json()
-                answer = extract_text(data) or "⚠️ Antwort leer."
+# -----------------------
+# 2) PENDING REQUEST: Webhook call + Assistant speichern
+# -----------------------
+if st.session_state.pending_payload:
+    payload = st.session_state.pending_payload
+    st.session_state.pending_payload = None
 
-                if debug_mode:
-                    st.caption("Debug (Response-Meta):")
-                    st.json(extract_debug(data))
-            else:
-                answer = f"❌ Fehler {response.status_code}: {response.text}"
+    # Wir rendern die Antwort im nächsten Run über die normale Chat-Liste,
+    # damit UI-Zustände nicht "halb" bleiben.
+    try:
+        response = requests.post(
+            N8N_WEBHOOK_URL,
+            json=payload,
+            headers={"X-Request-Id": payload["request_id"]},
+            timeout=60,
+        )
 
-        except Exception as e:
-            answer = f"⚠️ Exception: {e}"
+        if response.status_code == 200:
+            data = response.json()
+            answer = extract_text(data) or "⚠️ Antwort leer."
+            meta = extract_debug(data) if debug_mode else {}
+        else:
+            answer = f"❌ Fehler {response.status_code}: {response.text}"
+            meta = {"error": "http_error", "status_code": response.status_code}
 
-        placeholder.markdown(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+    except Exception as e:
+        answer = f"⚠️ Exception: {e}"
+        meta = {"error": "exception", "message": str(e)}
+
+    add_message("assistant", answer, meta=meta)
+
+    # Nochmals rerun, damit die Assistant-Antwort sauber im Chat erscheint
+    st.rerun()
