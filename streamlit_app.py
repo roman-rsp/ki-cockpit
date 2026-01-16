@@ -23,6 +23,10 @@ if "messages" not in st.session_state:
 if "pending_payload" not in st.session_state:
     st.session_state.pending_payload = None
 
+# Uploader-Reset (damit ein Bild nicht bei der nächsten Anfrage erneut mitgesendet wird)
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
 # ------------------------------------------------------------
 # HELPER: Nachrichten sauber hinzufügen
 # ------------------------------------------------------------
@@ -113,11 +117,13 @@ st.title("🧠 KI Cockpit")
 # ------------------------------------------------------------
 uploaded_file = st.file_uploader(
     "Bild hochladen (optional)",
-    type=["png", "jpg", "jpeg"]
+    type=["png", "jpg", "jpeg"],
+    key=f"uploader_{st.session_state.uploader_key}",
 )
 
 if uploaded_file:
-    st.image(uploaded_file, caption="Vorschau", use_column_width=True)
+    # kleiner anzeigen, damit es nicht den ganzen Screen dominiert
+    st.image(uploaded_file, caption="Vorschau", width=320)
 
 # ------------------------------------------------------------
 # CHAT RENDER
@@ -198,4 +204,8 @@ if st.session_state.pending_payload:
         meta = {"error": "exception", "message": str(e)}
 
     add_message("assistant", answer, meta=meta)
+
+    # Uploader leeren, damit das Bild nicht bei der nächsten Anfrage erneut mitgesendet wird
+    st.session_state.uploader_key += 1
+
     st.rerun()
