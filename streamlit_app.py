@@ -39,6 +39,29 @@ def add_message(role: str, content: str, meta: dict | None = None):
     }]
 
 # ------------------------------------------------------------
+# HELPER: Chat-History für Backend bauen (nur role+content)
+# ------------------------------------------------------------
+def build_history(max_items: int = 20) -> list[dict]:
+    """
+    Baut eine schlanke History:
+    - nur user/assistant
+    - nur role + content
+    - begrenzt auf die letzten max_items Messages
+    """
+    hist = []
+    for m in st.session_state.messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        hist.append({"role": role, "content": content.strip()})
+
+    # Nur die letzten N Einträge senden
+    return hist[-max_items:]
+
+# ------------------------------------------------------------
 # HELPER: Antwort robust extrahieren
 # ------------------------------------------------------------
 def extract_text(data) -> str:
@@ -122,7 +145,6 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file:
-    # kleiner anzeigen, damit es nicht den ganzen Screen dominiert
     st.image(uploaded_file, caption="Vorschau", width=320)
 
 # ------------------------------------------------------------
@@ -149,6 +171,10 @@ prompt = st.chat_input("Deine Nachricht …")
 if prompt:
     request_id = str(uuid.uuid4())
 
+    # History VOR dem Hinzufügen der neuen User-Message bauen
+    history = build_history(max_items=20)
+
+    # User-Message sofort im Chat anzeigen
     add_message("user", prompt)
 
     payload = {
@@ -157,6 +183,7 @@ if prompt:
         "project": project,
         "model": model,
         "master_prompt": master_prompt,
+        "history": history,
     }
 
     if uploaded_file:
@@ -180,9 +207,7 @@ if st.session_state.pending_payload:
             N8N_WEBHOOK_URL,
             json=payload,
             auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
-            headers={
-                "X-Request-Id": payload["request_id"]
-            },
+            headers={"X-Request-Id": payload["request_id"]},
             timeout=60,
         )
 
