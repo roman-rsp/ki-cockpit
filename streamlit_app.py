@@ -19,11 +19,10 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # Pending-Mechanik:
-# User-Nachricht sofort sichtbar, Request im nächsten Run
 if "pending_payload" not in st.session_state:
     st.session_state.pending_payload = None
 
-# Uploader-Reset (damit Dateien nicht bei der nächsten Anfrage erneut mitgesendet werden)
+# Uploader-Reset
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
@@ -42,12 +41,6 @@ def add_message(role: str, content: str, meta: dict | None = None):
 # HELPER: Chat-History für Backend bauen (nur role+content)
 # ------------------------------------------------------------
 def build_history(max_items: int = 20) -> list[dict]:
-    """
-    Baut eine schlanke History:
-    - nur user/assistant
-    - nur role + content
-    - begrenzt auf die letzten max_items Messages
-    """
     hist = []
     for m in st.session_state.messages:
         role = m.get("role")
@@ -57,22 +50,14 @@ def build_history(max_items: int = 20) -> list[dict]:
         if not isinstance(content, str) or not content.strip():
             continue
         hist.append({"role": role, "content": content.strip()})
-
-    # Nur die letzten N Einträge senden
     return hist[-max_items:]
 
 # ------------------------------------------------------------
 # HELPER: Antwort robust extrahieren
 # ------------------------------------------------------------
 def extract_text(data) -> str:
-    """
-    Priorität:
-    output / KI_answer / content /
-    OpenAI raw_response.output[].content[].text
-    """
     if isinstance(data, list) and data:
         data = data[0]
-
     if not isinstance(data, dict):
         return ""
 
@@ -99,7 +84,6 @@ def extract_debug(data) -> dict:
         data = data[0]
     if not isinstance(data, dict):
         return {"type": str(type(data))}
-
     return {
         "provider": data.get("provider"),
         "model": data.get("model"),
@@ -136,42 +120,6 @@ debug_mode = st.sidebar.toggle("Debug anzeigen", value=False)
 st.title("🧠 KI Cockpit")
 
 # ------------------------------------------------------------
-# UPLOADS
-# ------------------------------------------------------------
-st.subheader("Uploads (optional)")
-
-# Bilder: bis zu 3
-uploaded_images = st.file_uploader(
-    "Bilder hochladen (0–3)",
-    type=["png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-    key=f"uploader_images_{st.session_state.uploader_key}",
-)
-
-# PDF: optional (ein PDF vorerst; später erweitern wir auf mehrere, wenn du willst)
-uploaded_pdf = st.file_uploader(
-    "PDF hochladen (optional)",
-    type=["pdf"],
-    accept_multiple_files=False,
-    key=f"uploader_pdf_{st.session_state.uploader_key}",
-)
-
-# --- UI Vorschau / Hinweise
-if uploaded_images:
-    # Begrenzung auf 3 (hart in Code)
-    if len(uploaded_images) > 3:
-        st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
-        uploaded_images = uploaded_images[:3]
-
-    cols = st.columns(min(3, len(uploaded_images)))
-    for idx, img in enumerate(uploaded_images):
-        with cols[idx % len(cols)]:
-            st.image(img, caption=img.name, use_container_width=True)
-
-if uploaded_pdf:
-    st.caption(f"📄 PDF ausgewählt: {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
-
-# ------------------------------------------------------------
 # CHAT RENDER
 # ------------------------------------------------------------
 for msg in st.session_state.messages:
@@ -185,8 +133,44 @@ for msg in st.session_state.messages:
                 st.json(meta)
 
 # ------------------------------------------------------------
-# INPUT
+# INPUT-BEREICH (integriert)
 # ------------------------------------------------------------
+st.divider()
+st.caption("📎 Anhänge (optional)")
+
+# Bilder (0–3)
+uploaded_images = st.file_uploader(
+    "Bilder (max. 3)",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+    label_visibility="collapsed",
+    key=f"uploader_images_{st.session_state.uploader_key}",
+)
+
+# PDF (0–1)
+uploaded_pdf = st.file_uploader(
+    "PDF (optional)",
+    type=["pdf"],
+    accept_multiple_files=False,
+    label_visibility="collapsed",
+    key=f"uploader_pdf_{st.session_state.uploader_key}",
+)
+
+# Vorschau direkt im Input-Bereich
+if uploaded_images:
+    if len(uploaded_images) > 3:
+        st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
+        uploaded_images = uploaded_images[:3]
+
+    cols = st.columns(min(3, len(uploaded_images)))
+    for i, img in enumerate(uploaded_images):
+        with cols[i % len(cols)]:
+            st.image(img, caption=img.name, use_container_width=True)
+
+if uploaded_pdf:
+    st.caption(f"📄 {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
+
+# Chat Input ganz unten (bleibt Chat-typisch)
 prompt = st.chat_input("Deine Nachricht …")
 
 # ------------------------------------------------------------
@@ -195,13 +179,10 @@ prompt = st.chat_input("Deine Nachricht …")
 if prompt:
     request_id = str(uuid.uuid4())
 
-    # History VOR dem Hinzufügen der neuen User-Message bauen
     history = build_history(max_items=20)
 
-    # User-Message sofort im Chat anzeigen
     add_message("user", prompt)
 
-    # Grund-Payload
     payload = {
         "request_id": request_id,
         "message": prompt,
@@ -209,12 +190,11 @@ if prompt:
         "model": model,
         "master_prompt": master_prompt,
         "history": history,
-        # Neue, saubere Container:
         "images": [],
         "pdfs": [],
     }
 
-    # --- Bilder (0–3)
+    # Bilder
     if uploaded_images:
         if len(uploaded_images) > 3:
             uploaded_images = uploaded_images[:3]
@@ -227,7 +207,7 @@ if prompt:
                 "b64": base64.b64encode(img_bytes).decode("utf-8"),
             })
 
-    # --- PDF (0–1)
+    # PDF
     if uploaded_pdf:
         pdf_bytes = uploaded_pdf.getvalue()
         payload["pdfs"].append({
@@ -236,8 +216,7 @@ if prompt:
             "b64": base64.b64encode(pdf_bytes).decode("utf-8"),
         })
 
-    # Rückwärtskompatibilität (optional):
-    # Falls dein n8n noch auf die alten Keys hört, senden wir bei genau 1 Bild zusätzlich:
+    # Rückwärtskompatibilität (alt)
     if payload["images"] and len(payload["images"]) == 1:
         payload["image_base64"] = payload["images"][0]["b64"]
         payload["image_mime"] = payload["images"][0]["mime"]
@@ -281,7 +260,7 @@ if st.session_state.pending_payload:
 
     add_message("assistant", answer, meta=meta)
 
-    # Uploader leeren, damit Dateien nicht bei der nächsten Anfrage erneut mitgesendet werden
+    # Uploads leeren
     st.session_state.uploader_key += 1
 
     st.rerun()
