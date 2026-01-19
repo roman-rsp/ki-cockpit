@@ -23,7 +23,7 @@ if "messages" not in st.session_state:
 if "pending_payload" not in st.session_state:
     st.session_state.pending_payload = None
 
-# Uploader-Reset (damit ein Bild nicht bei der nächsten Anfrage erneut mitgesendet wird)
+# Uploader-Reset (damit Dateien nicht bei der nächsten Anfrage erneut mitgesendet werden)
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
@@ -136,16 +136,40 @@ debug_mode = st.sidebar.toggle("Debug anzeigen", value=False)
 st.title("🧠 KI Cockpit")
 
 # ------------------------------------------------------------
-# UPLOAD
+# UPLOADS
 # ------------------------------------------------------------
-uploaded_file = st.file_uploader(
-    "Bild hochladen (optional)",
+st.subheader("Uploads (optional)")
+
+# Bilder: bis zu 3
+uploaded_images = st.file_uploader(
+    "Bilder hochladen (0–3)",
     type=["png", "jpg", "jpeg"],
-    key=f"uploader_{st.session_state.uploader_key}",
+    accept_multiple_files=True,
+    key=f"uploader_images_{st.session_state.uploader_key}",
 )
 
-if uploaded_file:
-    st.image(uploaded_file, caption="Vorschau", width=320)
+# PDF: optional (ein PDF vorerst; später erweitern wir auf mehrere, wenn du willst)
+uploaded_pdf = st.file_uploader(
+    "PDF hochladen (optional)",
+    type=["pdf"],
+    accept_multiple_files=False,
+    key=f"uploader_pdf_{st.session_state.uploader_key}",
+)
+
+# --- UI Vorschau / Hinweise
+if uploaded_images:
+    # Begrenzung auf 3 (hart in Code)
+    if len(uploaded_images) > 3:
+        st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
+        uploaded_images = uploaded_images[:3]
+
+    cols = st.columns(min(3, len(uploaded_images)))
+    for idx, img in enumerate(uploaded_images):
+        with cols[idx % len(cols)]:
+            st.image(img, caption=img.name, use_container_width=True)
+
+if uploaded_pdf:
+    st.caption(f"📄 PDF ausgewählt: {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
 
 # ------------------------------------------------------------
 # CHAT RENDER
@@ -177,6 +201,7 @@ if prompt:
     # User-Message sofort im Chat anzeigen
     add_message("user", prompt)
 
+    # Grund-Payload
     payload = {
         "request_id": request_id,
         "message": prompt,
@@ -184,13 +209,39 @@ if prompt:
         "model": model,
         "master_prompt": master_prompt,
         "history": history,
+        # Neue, saubere Container:
+        "images": [],
+        "pdfs": [],
     }
 
-    if uploaded_file:
-        image_bytes = uploaded_file.getvalue()
-        payload["image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
-        payload["image_mime"] = uploaded_file.type
-        payload["image_name"] = uploaded_file.name
+    # --- Bilder (0–3)
+    if uploaded_images:
+        if len(uploaded_images) > 3:
+            uploaded_images = uploaded_images[:3]
+
+        for img in uploaded_images:
+            img_bytes = img.getvalue()
+            payload["images"].append({
+                "filename": img.name,
+                "mime": img.type,
+                "b64": base64.b64encode(img_bytes).decode("utf-8"),
+            })
+
+    # --- PDF (0–1)
+    if uploaded_pdf:
+        pdf_bytes = uploaded_pdf.getvalue()
+        payload["pdfs"].append({
+            "filename": uploaded_pdf.name,
+            "mime": uploaded_pdf.type or "application/pdf",
+            "b64": base64.b64encode(pdf_bytes).decode("utf-8"),
+        })
+
+    # Rückwärtskompatibilität (optional):
+    # Falls dein n8n noch auf die alten Keys hört, senden wir bei genau 1 Bild zusätzlich:
+    if payload["images"] and len(payload["images"]) == 1:
+        payload["image_base64"] = payload["images"][0]["b64"]
+        payload["image_mime"] = payload["images"][0]["mime"]
+        payload["image_name"] = payload["images"][0]["filename"]
 
     st.session_state.pending_payload = payload
     st.rerun()
@@ -230,7 +281,7 @@ if st.session_state.pending_payload:
 
     add_message("assistant", answer, meta=meta)
 
-    # Uploader leeren, damit das Bild nicht bei der nächsten Anfrage erneut mitgesendet wird
+    # Uploader leeren, damit Dateien nicht bei der nächsten Anfrage erneut mitgesendet werden
     st.session_state.uploader_key += 1
 
     st.rerun()
