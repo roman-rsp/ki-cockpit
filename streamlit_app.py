@@ -2,11 +2,14 @@ import streamlit as st
 import requests
 import base64
 import uuid
+from PIL import Image
+import io
 
 # ------------------------------------------------------------
 # KONFIGURATION (Secrets aus Streamlit Cloud)
 # ------------------------------------------------------------
 N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
+N8N_MODELS_URL = st.secrets.get("N8N_MODELS_URL")  # z.B. https://.../webhook/models
 N8N_BASIC_USER = st.secrets["N8N_BASIC_USER"]
 N8N_BASIC_PASS = st.secrets["N8N_BASIC_PASS"]
 
@@ -106,16 +109,76 @@ def reset_uploads():
 
 
 # ------------------------------------------------------------
+# MODELLKATALOG (aus n8n: GET /models)
+# ------------------------------------------------------------
+DEFAULT_MODELS = [
+    {"id": "gpt-4o-mini", "label": "GPT-4o mini", "provider": "openai"},
+    {"id": "gpt-4.1", "label": "GPT-4.1", "provider": "openai"},
+    {"id": "gemini-1.5-flash", "label": "Gemini 1.5 Flash", "provider": "gemini"},
+]
+
+@st.cache_data(ttl=600)  # 10 Minuten
+def fetch_models() -> list[dict]:
+    if not N8N_MODELS_URL:
+        return DEFAULT_MODELS
+
+    try:
+        r = requests.get(
+            N8N_MODELS_URL,
+            auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return DEFAULT_MODELS
+
+        data = r.json()
+        # Erwartet: {"models":[{id,label,provider,...}, ...]} oder direkt Liste
+        models = data.get("models") if isinstance(data, dict) else data
+        if not isinstance(models, list) or not models:
+            return DEFAULT_MODELS
+
+        cleaned = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            mid = (m.get("id") or "").strip()
+            label = (m.get("label") or mid).strip()
+            provider = (m.get("provider") or "").strip()
+            if not mid:
+                continue
+            cleaned.append({"id": mid, "label": label, "provider": provider})
+
+        return cleaned or DEFAULT_MODELS
+    except Exception:
+        return DEFAULT_MODELS
+
+
+# ------------------------------------------------------------
 # SIDEBAR
 # ------------------------------------------------------------
 st.sidebar.title("Projekte")
 
 project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 
-model = st.sidebar.selectbox(
+models = fetch_models()
+model_labels = [m["label"] for m in models]
+
+# stabiler Default: wenn "gpt-4o-mini" vorhanden, sonst erstes Modell
+default_id = "gpt-4o-mini"
+default_index = 0
+for i, m in enumerate(models):
+    if m["id"] == default_id:
+        default_index = i
+        break
+
+selected_label = st.sidebar.selectbox(
     "KI-Modell",
-    ["gpt-4o-mini", "gpt-4.1", "gemini-1.5-flash"],
+    model_labels,
+    index=default_index,
 )
+
+# Wir senden an n8n immer die model-id
+selected_model = next((m["id"] for m in models if m["label"] == selected_label), models[default_index]["id"])
 
 master_prompt = st.sidebar.text_area(
     "Master-Plan",
@@ -176,16 +239,32 @@ uploaded_pdf = st.file_uploader(
     key=f"uploader_pdf_{st.session_state.uploader_key}",
 )
 
-# Vorschau
+# Vorschau (kleiner)
+THUMB_WIDTH = 160  # px
+
+def render_thumb(file):
+    try:
+        img = Image.open(file)
+        img = img.convert("RGB")
+        # proportional verkleinern
+        w, h = img.size
+        if w > THUMB_WIDTH:
+            new_h = int((THUMB_WIDTH / w) * h)
+            img = img.resize((THUMB_WIDTH, new_h))
+        st.image(img, caption=file.name, width=THUMB_WIDTH)
+    except Exception:
+        # Fallback ohne PIL
+        st.image(file, caption=file.name, width=THUMB_WIDTH)
+
 if uploaded_images:
     if len(uploaded_images) > 3:
         st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
         uploaded_images = uploaded_images[:3]
 
-    cols = st.columns(min(3, len(uploaded_images)))
+    cols = st.columns(3)
     for i, img in enumerate(uploaded_images):
-        with cols[i % len(cols)]:
-            st.image(img, caption=img.name, use_container_width=True)
+        with cols[i % 3]:
+            render_thumb(img)
 
 if uploaded_pdf:
     st.caption(f"📄 {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
@@ -229,7 +308,7 @@ if prompt:
         "request_id": request_id,
         "message": prompt,
         "project": project,
-        "model": model,
+        "model": selected_model,  # <-- dynamisch!
         "master_prompt": master_prompt,
         "history": history,
         "images": st.session_state.frozen_images,
