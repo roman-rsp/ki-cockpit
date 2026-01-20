@@ -7,14 +7,13 @@ import uuid
 # KONFIGURATION (Secrets aus Streamlit Cloud)
 # ------------------------------------------------------------
 N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
+N8N_MODELS_URL = st.secrets.get("N8N_MODELS_URL", "")
 N8N_BASIC_USER = st.secrets["N8N_BASIC_USER"]
 N8N_BASIC_PASS = st.secrets["N8N_BASIC_PASS"]
 
-# NEU: Models-Endpoint (z.B. https://.../webhook/models)
-# Lege das als Secret an, damit du nicht hardcodest:
-N8N_MODELS_URL = st.secrets.get("N8N_MODELS_URL")
-
 st.set_page_config(page_title="KI Cockpit", layout="wide")
+
+THUMB_W = 160  # Thumbnail-Breite für Bildvorschau
 
 # ------------------------------------------------------------
 # SESSION STATE DEFAULTS
@@ -28,54 +27,23 @@ if "pending_payload" not in st.session_state:
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
+# Freeze-Mechanik: wir speichern Anhänge beim Senden in Session-State
 if "frozen_images" not in st.session_state:
     st.session_state.frozen_images = []
 
 if "frozen_pdf" not in st.session_state:
     st.session_state.frozen_pdf = None
 
-# NEU: Model Catalog Cache
+# Model Catalog Cache
 if "model_catalog" not in st.session_state:
-    st.session_state.model_catalog = None
+    st.session_state.model_catalog = []
 
-# ------------------------------------------------------------
-# HELPER: Model Catalog laden
-# ------------------------------------------------------------
-def load_model_catalog() -> list[dict]:
-    # Fallback: wenn kein URL gesetzt ist, nimm eine minimale Liste
-    fallback = [
-        {"id": "gpt-4o-mini", "label": "OpenAI · gpt-4o-mini", "provider": "openai", "cap": ["text", "vision", "pdf_text"]},
-    ]
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = None
 
-    if not N8N_MODELS_URL:
-        return fallback
+if "debug_mode" not in st.session_state:
+    st.session_state.debug_mode = False
 
-    try:
-        r = requests.get(
-            N8N_MODELS_URL,
-            auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        # Dein Workflow liefert aktuell ein Objekt mit "models": [...]
-        models = data.get("models")
-        if isinstance(models, list) and models:
-            # leicht robust machen: nur gültige Einträge
-            cleaned = []
-            for m in models:
-                if not isinstance(m, dict):
-                    continue
-                if not m.get("id") or not m.get("label") or not m.get("provider"):
-                    continue
-                cleaned.append(m)
-            return cleaned or fallback
-
-        return fallback
-
-    except Exception:
-        return fallback
 
 # ------------------------------------------------------------
 # HELPER: Nachrichten sauber hinzufügen
@@ -88,6 +56,7 @@ def add_message(role: str, content: str, meta: dict | None = None):
         "meta": meta or {},
     }]
 
+
 def build_history(max_items: int = 20) -> list[dict]:
     hist = []
     for m in st.session_state.messages:
@@ -99,6 +68,7 @@ def build_history(max_items: int = 20) -> list[dict]:
             continue
         hist.append({"role": role, "content": content.strip()})
     return hist[-max_items:]
+
 
 def extract_text(data) -> str:
     if isinstance(data, list) and data:
@@ -124,6 +94,7 @@ def extract_text(data) -> str:
 
     return ""
 
+
 def extract_debug(data) -> dict:
     if isinstance(data, list) and data:
         data = data[0]
@@ -140,41 +111,150 @@ def extract_debug(data) -> dict:
         "request_id": data.get("request_id"),
     }
 
+
 def reset_uploads():
     st.session_state.frozen_images = []
     st.session_state.frozen_pdf = None
     st.session_state.uploader_key += 1
 
+
+# ------------------------------------------------------------
+# MODEL CATALOG (aus n8n laden)
+# ------------------------------------------------------------
+def fetch_models() -> list[dict]:
+    """
+    Erwartet Response von n8n wie:
+    { "models": [ { "id": "...", "label": "...", "provider": "...", "cap": [...] }, ... ] }
+    """
+    if not N8N_MODELS_URL:
+        return []
+
+    try:
+        r = requests.get(
+            N8N_MODELS_URL,
+            auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
+            timeout=20,
+            headers={"Accept": "application/json"},
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        models = data.get("models", [])
+        if not isinstance(models, list):
+            return []
+
+        cleaned: list[dict] = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+
+            mid = (m.get("id") or "").strip()
+            provider = (m.get("provider") or "").strip()
+
+            # Label fallback
+            label = (m.get("label") or "").strip()
+            if not label:
+                label = f"{provider} · {mid}".strip(" ·")
+
+            cap = m.get("cap") if isinstance(m.get("cap"), list) else []
+
+            if mid and provider:
+                cleaned.append({
+                    "id": mid,
+                    "provider": provider,
+                    "label": label,
+                    "cap": cap,
+                })
+
+        return cleaned
+
+    except Exception as e:
+        if st.session_state.get("debug_mode"):
+            st.sidebar.caption(f"Model-Fetch Fehler: {e}")
+        return []
+
+
+def ensure_models_loaded():
+    if not st.session_state.model_catalog:
+        st.session_state.model_catalog = fetch_models()
+
+    if st.session_state.model_catalog and not st.session_state.selected_model:
+        st.session_state.selected_model = st.session_state.model_catalog[0]
+
+
 # ------------------------------------------------------------
 # SIDEBAR
 # ------------------------------------------------------------
 st.sidebar.title("Projekte")
+
 project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 
-# NEU: Model Catalog laden (einmalig)
-if st.session_state.model_catalog is None:
-    st.session_state.model_catalog = load_model_catalog()
+# Debug Toggle in Session-State spiegeln
+debug_mode = st.sidebar.toggle("Debug anzeigen", value=st.session_state.debug_mode)
+st.session_state.debug_mode = debug_mode
+
+# Modelle laden (initial)
+ensure_models_loaded()
 
 with st.sidebar.expander("Modelle", expanded=True):
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("↻ Aktualisieren"):
-            st.session_state.model_catalog = load_model_catalog()
+    col_a, col_b = st.columns([1, 2])
+    with col_a:
+        if st.button("Aktualisieren"):
+            st.session_state.model_catalog = fetch_models()
+            if st.session_state.model_catalog:
+                # Auswahl beibehalten, falls möglich
+                if st.session_state.selected_model:
+                    cur = st.session_state.selected_model
+                    match = next(
+                        (m for m in st.session_state.model_catalog
+                         if m["id"] == cur.get("id") and m["provider"] == cur.get("provider")),
+                        None
+                    )
+                    st.session_state.selected_model = match or st.session_state.model_catalog[0]
+                else:
+                    st.session_state.selected_model = st.session_state.model_catalog[0]
             st.rerun()
-    with col2:
-        st.caption(f"{len(st.session_state.model_catalog)} Modelle")
 
+    models = st.session_state.model_catalog or []
+    st.caption(f"{len(models)} Modelle")
+
+    if debug_mode:
+        st.sidebar.json({"models_preview": models[:10]})
+
+# Fallback, falls gar keine Modelle geladen
+if not st.session_state.model_catalog:
+    st.session_state.model_catalog = [{
+        "id": "gpt-4o-mini",
+        "provider": "openai",
+        "label": "OpenAI · gpt-4o-mini",
+        "cap": ["text"],
+    }]
+    if not st.session_state.selected_model:
+        st.session_state.selected_model = st.session_state.model_catalog[0]
+
+# Selectbox: komplette Dicts als Options → zeigt garantiert alle
 models = st.session_state.model_catalog
-labels = [m["label"] for m in models]
+default_idx = 0
+if st.session_state.selected_model:
+    for i, m in enumerate(models):
+        if m["id"] == st.session_state.selected_model.get("id") and m["provider"] == st.session_state.selected_model.get("provider"):
+            default_idx = i
+            break
 
-selected_label = st.sidebar.selectbox("KI-Modell", labels, index=0)
-selected_model = next((m for m in models if m["label"] == selected_label), models[0])
+st.sidebar.caption("KI-Modell")
+selected_model = st.sidebar.selectbox(
+    "KI-Modell",
+    options=models,
+    index=default_idx,
+    format_func=lambda m: m.get("label") or f'{m.get("provider")} · {m.get("id")}',
+    label_visibility="collapsed",
+)
+st.session_state.selected_model = selected_model
 
-model_id = selected_model["id"]
-provider = selected_model["provider"]  # optional mitschicken
-
-master_prompt = st.sidebar.text_area("Master-Plan", value="Analysiere das Bild professionell.")
-debug_mode = st.sidebar.toggle("Debug anzeigen", value=False)
+master_prompt = st.sidebar.text_area(
+    "Master-Plan",
+    value="Analysiere das Bild professionell.",
+)
 
 st.sidebar.divider()
 col_a, col_b = st.sidebar.columns(2)
@@ -227,11 +307,7 @@ uploaded_pdf = st.file_uploader(
     key=f"uploader_pdf_{st.session_state.uploader_key}",
 )
 
-# ------------------------------------------------------------
-# NEU: kleinere Thumbnails
-# ------------------------------------------------------------
-THUMB_W = 170  # <— Größe anpassen (z.B. 120–220)
-
+# Vorschau (kleiner)
 if uploaded_images:
     if len(uploaded_images) > 3:
         st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
@@ -240,7 +316,8 @@ if uploaded_images:
     cols = st.columns(min(3, len(uploaded_images)))
     for i, img in enumerate(uploaded_images):
         with cols[i % len(cols)]:
-            st.image(img, caption=img.name, width=THUMB_W)
+            st.image(img, width=THUMB_W)
+            st.caption(img.name)
 
 if uploaded_pdf:
     st.caption(f"📄 {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
@@ -256,10 +333,11 @@ if prompt:
 
     add_message("user", prompt)
 
-    # Anhänge einfrieren
+    # Anhänge "einfrieren" (damit sich zwischen Reruns nichts ändert)
     frozen_images = []
     if uploaded_images:
-        for img in uploaded_images[:3]:
+        imgs = uploaded_images[:3]
+        for img in imgs:
             img_bytes = img.getvalue()
             frozen_images.append({
                 "filename": img.name,
@@ -279,12 +357,15 @@ if prompt:
     st.session_state.frozen_images = frozen_images
     st.session_state.frozen_pdf = frozen_pdf
 
+    # Gewähltes Modell sauber senden
+    selected = st.session_state.selected_model or {"id": "gpt-4o-mini", "provider": "openai"}
+
     payload = {
         "request_id": request_id,
         "message": prompt,
         "project": project,
-        "model": model_id,          # <— sendet Model-ID
-        "provider": provider,       # <— optional, hilft dem Router
+        "provider": selected["provider"],  # <-- wichtig
+        "model": selected["id"],
         "master_prompt": master_prompt,
         "history": history,
         "images": st.session_state.frozen_images,
@@ -312,13 +393,16 @@ if st.session_state.pending_payload:
             N8N_WEBHOOK_URL,
             json=payload,
             auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
-            headers={"X-Request-Id": payload["request_id"]},
+            headers={
+                "X-Request-Id": payload["request_id"],
+                "Accept": "application/json",
+            },
             timeout=60,
         )
 
         if response.status_code in (401, 403):
             answer = "❌ Zugriff verweigert (Auth)."
-            meta = {"error": "auth"}
+            meta = {"error": "auth", "status_code": response.status_code}
 
         elif response.status_code == 200:
             data = response.json()
@@ -335,5 +419,7 @@ if st.session_state.pending_payload:
 
     add_message("assistant", answer, meta=meta)
 
+    # Uploads wirklich leeren
     reset_uploads()
+
     st.rerun()
