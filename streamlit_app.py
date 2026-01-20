@@ -4,97 +4,244 @@ import base64
 import uuid
 
 # ------------------------------------------------------------
-# KONFIGURATION (Secrets)
+# KONFIGURATION (Secrets aus Streamlit Cloud)
 # ------------------------------------------------------------
 N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
-N8N_MODELS_URL  = st.secrets["N8N_MODELS_URL"]
+N8N_MODELS_URL  = st.secrets.get("N8N_MODELS_URL", "")
 N8N_BASIC_USER  = st.secrets["N8N_BASIC_USER"]
 N8N_BASIC_PASS  = st.secrets["N8N_BASIC_PASS"]
 
 st.set_page_config(page_title="KI Cockpit", layout="wide")
 
 # ------------------------------------------------------------
-# SESSION STATE
+# SESSION STATE DEFAULTS
 # ------------------------------------------------------------
-st.session_state.setdefault("messages", [])
-st.session_state.setdefault("models", [])
-st.session_state.setdefault("model_map", {})
-st.session_state.setdefault("models_loaded", False)
-st.session_state.setdefault("uploader_key", 0)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "pending_payload" not in st.session_state:
+    st.session_state.pending_payload = None
+
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+# Freeze-Mechanik: Anhänge beim Senden "einfrieren"
+if "frozen_images" not in st.session_state:
+    st.session_state.frozen_images = []
+
+if "frozen_pdf" not in st.session_state:
+    st.session_state.frozen_pdf = None
+
+# Model Catalog Cache
+if "models" not in st.session_state:
+    st.session_state.models = []  # Liste von dicts: {id,label,provider,cap}
+if "models_error" not in st.session_state:
+    st.session_state.models_error = None
+if "selected_model_key" not in st.session_state:
+    # key-Format: "provider::id"
+    st.session_state.selected_model_key = "openai::gpt-4o-mini"
 
 # ------------------------------------------------------------
-# HELPER
+# HELPER: Nachrichten sauber hinzufügen
 # ------------------------------------------------------------
-def auth():
-    return (N8N_BASIC_USER, N8N_BASIC_PASS)
-
-
-def load_models():
-    try:
-        r = requests.get(N8N_MODELS_URL, auth=auth(), timeout=10)
-        r.raise_for_status()
-        data = r.json()
-
-        models = data.get("models", [])
-        model_map = {m["label"]: m["id"] for m in models}
-
-        st.session_state.models = models
-        st.session_state.model_map = model_map
-        st.session_state.models_loaded = True
-
-    except Exception as e:
-        st.session_state.models = []
-        st.session_state.model_map = {}
-        st.session_state.models_loaded = False
-        st.error(f"Modelle konnten nicht geladen werden: {e}")
-
-
-def add_message(role, content, meta=None):
-    st.session_state.messages.append({
+def add_message(role: str, content: str, meta: dict | None = None):
+    st.session_state.messages = st.session_state.messages + [{
         "id": str(uuid.uuid4()),
         "role": role,
         "content": content,
-        "meta": meta or {}
-    })
+        "meta": meta or {},
+    }]
 
+def build_history(max_items: int = 20) -> list[dict]:
+    hist = []
+    for m in st.session_state.messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        hist.append({"role": role, "content": content.strip()})
+    return hist[-max_items:]
+
+def extract_text(data) -> str:
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        return ""
+
+    for key in ("output", "KI_answer", "content"):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    rr = data.get("raw_response") or {}
+    try:
+        for item in rr.get("output", []):
+            for p in item.get("content", []):
+                if p.get("type") == "output_text" and isinstance(p.get("text"), str):
+                    txt = p["text"].strip()
+                    if txt:
+                        return txt
+    except Exception:
+        pass
+
+    return ""
+
+def extract_debug(data) -> dict:
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        return {"type": str(type(data))}
+    return {
+        "provider": data.get("provider"),
+        "model": data.get("model"),
+        "role": data.get("role"),
+        "has_raw_response": bool(data.get("raw_response")),
+        "keys": sorted(list(data.keys()))[:50],
+        "error": data.get("error"),
+        "project_id": data.get("project_id"),
+        "request_id": data.get("request_id"),
+    }
+
+def reset_uploads():
+    st.session_state.frozen_images = []
+    st.session_state.frozen_pdf = None
+    st.session_state.uploader_key += 1
+
+# ------------------------------------------------------------
+# MODELS: Laden + Validieren
+# ------------------------------------------------------------
+def default_models() -> list[dict]:
+    # Fallback, falls Models-Endpunkt nicht erreichbar ist.
+    return [
+        {"id": "gpt-4o-mini", "label": "OpenAI · gpt-4o-mini", "provider": "openai", "cap": ["text", "vision", "pdf_text"]},
+        {"id": "gpt-4.1", "label": "OpenAI · gpt-4.1", "provider": "openai", "cap": ["text"]},
+        {"id": "gemini-1.5-flash", "label": "Gemini · 1.5 Flash", "provider": "gemini", "cap": ["text", "vision", "pdf_text"]},
+    ]
+
+def load_models():
+    st.session_state.models_error = None
+
+    if not N8N_MODELS_URL:
+        st.session_state.models = default_models()
+        st.session_state.models_error = "N8N_MODELS_URL fehlt in den Secrets. Fallback-Modelle aktiv."
+        return
+
+    try:
+        r = requests.get(
+            N8N_MODELS_URL,
+            auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
+            timeout=20,
+            headers={"Accept": "application/json"},
+        )
+        if r.status_code != 200:
+            st.session_state.models = default_models()
+            st.session_state.models_error = f"Models konnten nicht geladen werden: HTTP {r.status_code}"
+            return
+
+        data = r.json()
+        models = data.get("models")
+        if not isinstance(models, list) or not models:
+            st.session_state.models = default_models()
+            st.session_state.models_error = "Models-Endpunkt lieferte keine Liste. Fallback-Modelle aktiv."
+            return
+
+        # sanitisieren
+        cleaned = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("id")
+            provider = m.get("provider")
+            label = m.get("label") or f"{provider} · {mid}"
+            cap = m.get("cap") or []
+            if isinstance(mid, str) and mid and isinstance(provider, str) and provider:
+                cleaned.append({"id": mid, "provider": provider, "label": label, "cap": cap})
+
+        if not cleaned:
+            st.session_state.models = default_models()
+            st.session_state.models_error = "Models-Endpunkt lieferte ungültige Daten. Fallback-Modelle aktiv."
+            return
+
+        st.session_state.models = cleaned
+
+    except Exception as e:
+        st.session_state.models = default_models()
+        st.session_state.models_error = f"Models konnten nicht geladen werden ({type(e).__name__}). Fallback-Modelle aktiv."
+
+def ensure_selected_model_valid():
+    keys = {f'{m["provider"]}::{m["id"]}' for m in st.session_state.models}
+    if st.session_state.selected_model_key not in keys:
+        # Fallback auf erstes Modell
+        st.session_state.selected_model_key = next(iter(keys))
+
+# Beim ersten Start einmal laden
+if not st.session_state.models:
+    load_models()
+ensure_selected_model_valid()
 
 # ------------------------------------------------------------
 # SIDEBAR
 # ------------------------------------------------------------
 st.sidebar.title("Projekte")
+project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 
-project = st.sidebar.text_input("Projektname", "Neues Projekt")
+debug_mode = st.sidebar.toggle("Debug anzeigen", value=False)
 
-debug_mode = st.sidebar.toggle("Debug anzeigen", False)
+# Models-Panel
+with st.sidebar.expander("Modelle", expanded=True):
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        if st.button("Aktualisieren", use_container_width=True):
+            load_models()
+            ensure_selected_model_valid()
+            st.rerun()
+    with col_b:
+        st.caption(f"{len(st.session_state.models)} Modelle")
 
-st.sidebar.divider()
-st.sidebar.subheader("Modelle")
+    if st.session_state.models_error:
+        st.error(st.session_state.models_error)
 
-col1, col2 = st.sidebar.columns([1, 2])
-with col1:
-    if st.button("↻"):
-        load_models()
+# Dropdown: Labels anzeigen, aber Key sauber mappen
+model_options = {f'{m["provider"]}::{m["id"]}': m for m in st.session_state.models}
+model_labels = [model_options[k]["label"] for k in model_options.keys()]
+model_keys   = list(model_options.keys())
 
-with col2:
-    st.caption(f"{len(st.session_state.models)} Modelle")
+# Index bestimmen ohne KeyError
+try:
+    current_index = model_keys.index(st.session_state.selected_model_key)
+except ValueError:
+    current_index = 0
+    st.session_state.selected_model_key = model_keys[0]
 
-if not st.session_state.models_loaded:
-    st.info("Bitte Modelle aktualisieren")
+selected_label = st.sidebar.selectbox(
+    "KI-Modell",
+    model_labels,
+    index=current_index,
+)
 
-if st.session_state.model_map:
-    selected_label = st.sidebar.selectbox(
-        "KI-Modell",
-        list(st.session_state.model_map.keys())
-    )
-    selected_model = st.session_state.model_map[selected_label]
-else:
-    selected_model = None
-    st.sidebar.selectbox("KI-Modell", ["– keine Modelle –"])
+# Rück-mappen (Label → Key) stabil via Index
+selected_index = model_labels.index(selected_label)
+st.session_state.selected_model_key = model_keys[selected_index]
+selected_model = model_options[st.session_state.selected_model_key]
 
 master_prompt = st.sidebar.text_area(
     "Master-Plan",
-    "Analysiere das Bild professionell."
+    value="Analysiere das Bild professionell.",
 )
+
+st.sidebar.divider()
+col_a, col_b = st.sidebar.columns(2)
+with col_a:
+    if st.button("Anhänge leeren"):
+        reset_uploads()
+        st.rerun()
+with col_b:
+    if st.button("Chat leeren"):
+        st.session_state.messages = []
+        reset_uploads()
+        st.rerun()
 
 # ------------------------------------------------------------
 # HEADER
@@ -102,16 +249,19 @@ master_prompt = st.sidebar.text_area(
 st.title("🧠 KI Cockpit")
 
 # ------------------------------------------------------------
-# CHAT
+# CHAT RENDER
 # ------------------------------------------------------------
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        if debug_mode and msg["meta"]:
-            st.json(msg["meta"])
+        if debug_mode and msg["role"] == "assistant":
+            meta = msg.get("meta") or {}
+            if meta:
+                st.caption("Debug (Response-Meta):")
+                st.json(meta)
 
 # ------------------------------------------------------------
-# INPUT
+# INPUT-BEREICH
 # ------------------------------------------------------------
 st.divider()
 st.caption("📎 Anhänge (optional)")
@@ -120,71 +270,125 @@ uploaded_images = st.file_uploader(
     "Bilder (max. 3)",
     type=["png", "jpg", "jpeg"],
     accept_multiple_files=True,
-    key=f"img_{st.session_state.uploader_key}",
-    label_visibility="collapsed"
+    label_visibility="collapsed",
+    key=f"uploader_images_{st.session_state.uploader_key}",
 )
 
 uploaded_pdf = st.file_uploader(
-    "PDF",
+    "PDF (optional)",
     type=["pdf"],
-    key=f"pdf_{st.session_state.uploader_key}",
-    label_visibility="collapsed"
+    accept_multiple_files=False,
+    label_visibility="collapsed",
+    key=f"uploader_pdf_{st.session_state.uploader_key}",
 )
 
-# 🔽 kleinere Bild-Vorschau
+# Vorschau (kleiner)
+preview_size = 140  # px
 if uploaded_images:
+    if len(uploaded_images) > 3:
+        st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
+        uploaded_images = uploaded_images[:3]
+
     cols = st.columns(min(3, len(uploaded_images)))
-    for i, img in enumerate(uploaded_images[:3]):
-        with cols[i]:
-            st.image(img, width=140)
+    for i, img in enumerate(uploaded_images):
+        with cols[i % len(cols)]:
+            # use_container_width=False + width=... ergibt echte Miniaturen
+            st.image(img, caption=img.name, width=preview_size)
+
+if uploaded_pdf:
+    st.caption(f"📄 {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
 
 prompt = st.chat_input("Deine Nachricht …")
 
 # ------------------------------------------------------------
-# SENDEN
+# 1) USER-EINGABE
 # ------------------------------------------------------------
-if prompt and selected_model:
+if prompt:
+    request_id = str(uuid.uuid4())
+    history = build_history(max_items=20)
+
     add_message("user", prompt)
 
-    images_payload = []
-    for img in (uploaded_images or [])[:3]:
-        images_payload.append({
-            "filename": img.name,
-            "mime": img.type,
-            "b64": base64.b64encode(img.getvalue()).decode()
-        })
+    # Anhänge "einfrieren"
+    frozen_images = []
+    if uploaded_images:
+        imgs = uploaded_images[:3]
+        for img in imgs:
+            img_bytes = img.getvalue()
+            frozen_images.append({
+                "filename": img.name,
+                "mime": img.type,
+                "b64": base64.b64encode(img_bytes).decode("utf-8"),
+            })
 
-    pdfs_payload = []
+    frozen_pdf = None
     if uploaded_pdf:
-        pdfs_payload.append({
+        pdf_bytes = uploaded_pdf.getvalue()
+        frozen_pdf = {
             "filename": uploaded_pdf.name,
-            "mime": uploaded_pdf.type,
-            "b64": base64.b64encode(uploaded_pdf.getvalue()).decode()
-        })
+            "mime": uploaded_pdf.type or "application/pdf",
+            "b64": base64.b64encode(pdf_bytes).decode("utf-8"),
+        }
+
+    st.session_state.frozen_images = frozen_images
+    st.session_state.frozen_pdf = frozen_pdf
 
     payload = {
-        "request_id": str(uuid.uuid4()),
-        "project": project,
-        "model": selected_model,
+        "request_id": request_id,
         "message": prompt,
+        "project": project,
+        # Für Backend: model id + provider separat senden
+        "provider": selected_model["provider"],
+        "model": selected_model["id"],
         "master_prompt": master_prompt,
-        "images": images_payload,
-        "pdfs": pdfs_payload,
+        "history": history,
+        "images": st.session_state.frozen_images,
+        "pdfs": [st.session_state.frozen_pdf] if st.session_state.frozen_pdf else [],
     }
 
-    r = requests.post(
-        N8N_WEBHOOK_URL,
-        json=payload,
-        auth=auth(),
-        timeout=60
-    )
+    # Rückwärtskompatibilität (alt)
+    if payload["images"] and len(payload["images"]) == 1:
+        payload["image_base64"] = payload["images"][0]["b64"]
+        payload["image_mime"] = payload["images"][0]["mime"]
+        payload["image_name"] = payload["images"][0]["filename"]
 
-    if r.ok:
-        data = r.json()
-        answer = data.get("output") or data.get("content") or "⚠️ Leere Antwort"
-        add_message("assistant", answer, data if debug_mode else None)
-    else:
-        add_message("assistant", f"❌ Fehler {r.status_code}")
+    st.session_state.pending_payload = payload
+    st.rerun()
 
-    st.session_state.uploader_key += 1
+# ------------------------------------------------------------
+# 2) PENDING REQUEST → n8n
+# ------------------------------------------------------------
+if st.session_state.pending_payload:
+    payload = st.session_state.pending_payload
+    st.session_state.pending_payload = None
+
+    try:
+        response = requests.post(
+            N8N_WEBHOOK_URL,
+            json=payload,
+            auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
+            headers={"X-Request-Id": payload["request_id"]},
+            timeout=60,
+        )
+
+        if response.status_code in (401, 403):
+            answer = "❌ Zugriff verweigert (Auth)."
+            meta = {"error": "auth"}
+
+        elif response.status_code == 200:
+            data = response.json()
+            answer = extract_text(data) or "⚠️ Antwort leer."
+            meta = extract_debug(data) if debug_mode else {}
+
+        else:
+            answer = f"❌ Fehler {response.status_code}: {response.text}"
+            meta = {"error": "http_error", "status_code": response.status_code}
+
+    except Exception as e:
+        answer = f"⚠️ Exception: {e}"
+        meta = {"error": "exception", "message": str(e)}
+
+    add_message("assistant", answer, meta=meta)
+
+    reset_uploads()
     st.rerun()
