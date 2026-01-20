@@ -228,7 +228,7 @@ selected_model = model_options[st.session_state.selected_model_key]
 
 master_prompt = st.sidebar.text_area(
     "Master-Plan",
-    value="Analysiere das Bild professionell.",
+    value="Antworte kurz und bündig.",
 )
 
 st.sidebar.divider()
