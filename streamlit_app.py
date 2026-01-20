@@ -2,18 +2,17 @@ import streamlit as st
 import requests
 import base64
 import uuid
+from typing import Any
 
 # ------------------------------------------------------------
 # KONFIGURATION (Secrets aus Streamlit Cloud)
 # ------------------------------------------------------------
 N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
-N8N_MODELS_URL = st.secrets.get("N8N_MODELS_URL", "")
+N8N_MODELS_URL = st.secrets["N8N_MODELS_URL"]
 N8N_BASIC_USER = st.secrets["N8N_BASIC_USER"]
 N8N_BASIC_PASS = st.secrets["N8N_BASIC_PASS"]
 
 st.set_page_config(page_title="KI Cockpit", layout="wide")
-
-THUMB_W = 160  # Thumbnail-Breite für Bildvorschau
 
 # ------------------------------------------------------------
 # SESSION STATE DEFAULTS
@@ -34,16 +33,11 @@ if "frozen_images" not in st.session_state:
 if "frozen_pdf" not in st.session_state:
     st.session_state.frozen_pdf = None
 
-# Model Catalog Cache
-if "model_catalog" not in st.session_state:
-    st.session_state.model_catalog = []
-
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = None
-
-if "debug_mode" not in st.session_state:
-    st.session_state.debug_mode = False
-
+# Models Cache
+if "models_cache" not in st.session_state:
+    st.session_state.models_cache = []
+if "models_error" not in st.session_state:
+    st.session_state.models_error = None
 
 # ------------------------------------------------------------
 # HELPER: Nachrichten sauber hinzufügen
@@ -56,7 +50,6 @@ def add_message(role: str, content: str, meta: dict | None = None):
         "meta": meta or {},
     }]
 
-
 def build_history(max_items: int = 20) -> list[dict]:
     hist = []
     for m in st.session_state.messages:
@@ -68,7 +61,6 @@ def build_history(max_items: int = 20) -> list[dict]:
             continue
         hist.append({"role": role, "content": content.strip()})
     return hist[-max_items:]
-
 
 def extract_text(data) -> str:
     if isinstance(data, list) and data:
@@ -94,7 +86,6 @@ def extract_text(data) -> str:
 
     return ""
 
-
 def extract_debug(data) -> dict:
     if isinstance(data, list) and data:
         data = data[0]
@@ -111,76 +102,80 @@ def extract_debug(data) -> dict:
         "request_id": data.get("request_id"),
     }
 
-
 def reset_uploads():
     st.session_state.frozen_images = []
     st.session_state.frozen_pdf = None
     st.session_state.uploader_key += 1
 
-
 # ------------------------------------------------------------
-# MODEL CATALOG (aus n8n laden)
+# MODELS: Fetch + Normalize
 # ------------------------------------------------------------
-def fetch_models() -> list[dict]:
+def normalize_models_response(payload: Any) -> list[dict]:
     """
-    Erwartet Response von n8n wie:
-    { "models": [ { "id": "...", "label": "...", "provider": "...", "cap": [...] }, ... ] }
+    Erwartete Formen:
+    - {"models":[...]}
+    - [{"models":[...]}]
+    - direkt: [...]
     """
-    if not N8N_MODELS_URL:
-        return []
-
-    try:
-        r = requests.get(
-            N8N_MODELS_URL,
-            auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
-            timeout=20,
-            headers={"Accept": "application/json"},
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        models = data.get("models", [])
-        if not isinstance(models, list):
+    if isinstance(payload, list):
+        if len(payload) == 0:
             return []
-
-        cleaned: list[dict] = []
-        for m in models:
-            if not isinstance(m, dict):
-                continue
-
-            mid = (m.get("id") or "").strip()
-            provider = (m.get("provider") or "").strip()
-
-            # Label fallback
-            label = (m.get("label") or "").strip()
-            if not label:
-                label = f"{provider} · {mid}".strip(" ·")
-
-            cap = m.get("cap") if isinstance(m.get("cap"), list) else []
-
-            if mid and provider:
-                cleaned.append({
-                    "id": mid,
-                    "provider": provider,
-                    "label": label,
-                    "cap": cap,
-                })
-
-        return cleaned
-
-    except Exception as e:
-        if st.session_state.get("debug_mode"):
-            st.sidebar.caption(f"Model-Fetch Fehler: {e}")
+        # häufig: [{"models":[...]}]
+        if isinstance(payload[0], dict) and "models" in payload[0]:
+            models = payload[0].get("models")
+            return models if isinstance(models, list) else []
+        # alternativ: direkt Liste von Modellen
+        if all(isinstance(x, dict) and "id" in x for x in payload):
+            return payload
         return []
 
+    if isinstance(payload, dict):
+        models = payload.get("models")
+        return models if isinstance(models, list) else []
 
-def ensure_models_loaded():
-    if not st.session_state.model_catalog:
-        st.session_state.model_catalog = fetch_models()
+    return []
 
-    if st.session_state.model_catalog and not st.session_state.selected_model:
-        st.session_state.selected_model = st.session_state.model_catalog[0]
+def fetch_models() -> list[dict]:
+    r = requests.get(
+        N8N_MODELS_URL,
+        auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
+        timeout=30,
+        headers={"accept": "application/json"},
+    )
+    r.raise_for_status()
+    data = r.json()
+    models = normalize_models_response(data)
 
+    # dedupe + stabile Sortierung nach label
+    seen = set()
+    clean = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        label = m.get("label") or mid
+        provider = m.get("provider") or "unknown"
+        cap = m.get("cap") if isinstance(m.get("cap"), list) else []
+        key = (provider, mid)
+        if not mid or key in seen:
+            continue
+        seen.add(key)
+        clean.append({"id": mid, "label": str(label), "provider": str(provider), "cap": cap})
+
+    clean.sort(key=lambda x: x["label"].lower())
+    return clean
+
+def refresh_models():
+    try:
+        st.session_state.models_cache = fetch_models()
+        st.session_state.models_error = None
+    except Exception as e:
+        st.session_state.models_error = str(e)
+        # Cache nicht wegwerfen – lieber alte Liste behalten
+
+# initial einmal laden (ohne Button)
+if not st.session_state.models_cache and st.session_state.models_error is None:
+    refresh_models()
 
 # ------------------------------------------------------------
 # SIDEBAR
@@ -189,67 +184,39 @@ st.sidebar.title("Projekte")
 
 project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 
-# Debug Toggle in Session-State spiegeln
-debug_mode = st.sidebar.toggle("Debug anzeigen", value=st.session_state.debug_mode)
-st.session_state.debug_mode = debug_mode
-
-# Modelle laden (initial)
-ensure_models_loaded()
+debug_mode = st.sidebar.toggle("Debug anzeigen", value=False)
 
 with st.sidebar.expander("Modelle", expanded=True):
     col_a, col_b = st.columns([1, 2])
     with col_a:
         if st.button("Aktualisieren"):
-            st.session_state.model_catalog = fetch_models()
-            if st.session_state.model_catalog:
-                # Auswahl beibehalten, falls möglich
-                if st.session_state.selected_model:
-                    cur = st.session_state.selected_model
-                    match = next(
-                        (m for m in st.session_state.model_catalog
-                         if m["id"] == cur.get("id") and m["provider"] == cur.get("provider")),
-                        None
-                    )
-                    st.session_state.selected_model = match or st.session_state.model_catalog[0]
-                else:
-                    st.session_state.selected_model = st.session_state.model_catalog[0]
+            refresh_models()
             st.rerun()
 
-    models = st.session_state.model_catalog or []
+    models = st.session_state.models_cache
     st.caption(f"{len(models)} Modelle")
 
+    if st.session_state.models_error:
+        st.warning(f"Models-Endpoint Fehler: {st.session_state.models_error}")
+
     if debug_mode:
-        st.sidebar.json({"models_preview": models[:10]})
+        st.json({"models_preview": models[:10]})
 
-# Fallback, falls gar keine Modelle geladen
-if not st.session_state.model_catalog:
-    st.session_state.model_catalog = [{
-        "id": "gpt-4o-mini",
-        "provider": "openai",
-        "label": "OpenAI · gpt-4o-mini",
-        "cap": ["text"],
-    }]
-    if not st.session_state.selected_model:
-        st.session_state.selected_model = st.session_state.model_catalog[0]
-
-# Selectbox: komplette Dicts als Options → zeigt garantiert alle
-models = st.session_state.model_catalog
-default_idx = 0
-if st.session_state.selected_model:
-    for i, m in enumerate(models):
-        if m["id"] == st.session_state.selected_model.get("id") and m["provider"] == st.session_state.selected_model.get("provider"):
-            default_idx = i
-            break
-
-st.sidebar.caption("KI-Modell")
-selected_model = st.sidebar.selectbox(
-    "KI-Modell",
-    options=models,
-    index=default_idx,
-    format_func=lambda m: m.get("label") or f'{m.get("provider")} · {m.get("id")}',
-    label_visibility="collapsed",
-)
-st.session_state.selected_model = selected_model
+# Auswahl: falls leer -> fallback
+if st.session_state.models_cache:
+    selected_model = st.sidebar.selectbox(
+        "KI-Modell",
+        st.session_state.models_cache,
+        format_func=lambda m: m["label"],
+        index=0,
+    )
+    model_id = selected_model["id"]
+    model_provider = selected_model["provider"]
+else:
+    # Fallback (damit UI nicht bricht)
+    model_id = "gpt-4o-mini"
+    model_provider = "openai"
+    st.sidebar.selectbox("KI-Modell", [f"{model_provider} · {model_id}"], index=0)
 
 master_prompt = st.sidebar.text_area(
     "Master-Plan",
@@ -307,7 +274,9 @@ uploaded_pdf = st.file_uploader(
     key=f"uploader_pdf_{st.session_state.uploader_key}",
 )
 
-# Vorschau (kleiner)
+# Vorschau: kleiner darstellen
+THUMB_WIDTH = 160
+
 if uploaded_images:
     if len(uploaded_images) > 3:
         st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
@@ -316,8 +285,7 @@ if uploaded_images:
     cols = st.columns(min(3, len(uploaded_images)))
     for i, img in enumerate(uploaded_images):
         with cols[i % len(cols)]:
-            st.image(img, width=THUMB_W)
-            st.caption(img.name)
+            st.image(img, caption=img.name, width=THUMB_WIDTH)
 
 if uploaded_pdf:
     st.caption(f"📄 {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
@@ -357,15 +325,15 @@ if prompt:
     st.session_state.frozen_images = frozen_images
     st.session_state.frozen_pdf = frozen_pdf
 
-    # Gewähltes Modell sauber senden
-    selected = st.session_state.selected_model or {"id": "gpt-4o-mini", "provider": "openai"}
-
     payload = {
         "request_id": request_id,
         "message": prompt,
         "project": project,
-        "provider": selected["provider"],  # <-- wichtig
-        "model": selected["id"],
+
+        # Wichtig: id + provider getrennt schicken (robuster fürs Routing)
+        "model": model_id,
+        "provider": model_provider,
+
         "master_prompt": master_prompt,
         "history": history,
         "images": st.session_state.frozen_images,
@@ -393,16 +361,13 @@ if st.session_state.pending_payload:
             N8N_WEBHOOK_URL,
             json=payload,
             auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
-            headers={
-                "X-Request-Id": payload["request_id"],
-                "Accept": "application/json",
-            },
+            headers={"X-Request-Id": payload["request_id"]},
             timeout=60,
         )
 
         if response.status_code in (401, 403):
             answer = "❌ Zugriff verweigert (Auth)."
-            meta = {"error": "auth", "status_code": response.status_code}
+            meta = {"error": "auth"}
 
         elif response.status_code == 200:
             data = response.json()
