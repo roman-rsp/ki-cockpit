@@ -18,13 +18,19 @@ st.set_page_config(page_title="KI Cockpit", layout="wide")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Pending-Mechanik:
 if "pending_payload" not in st.session_state:
     st.session_state.pending_payload = None
 
-# Uploader-Reset
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
+
+# Freeze-Mechanik: wir speichern Anhänge beim Senden in Session-State
+if "frozen_images" not in st.session_state:
+    st.session_state.frozen_images = []
+
+if "frozen_pdf" not in st.session_state:
+    st.session_state.frozen_pdf = None
+
 
 # ------------------------------------------------------------
 # HELPER: Nachrichten sauber hinzufügen
@@ -37,9 +43,7 @@ def add_message(role: str, content: str, meta: dict | None = None):
         "meta": meta or {},
     }]
 
-# ------------------------------------------------------------
-# HELPER: Chat-History für Backend bauen (nur role+content)
-# ------------------------------------------------------------
+
 def build_history(max_items: int = 20) -> list[dict]:
     hist = []
     for m in st.session_state.messages:
@@ -52,9 +56,7 @@ def build_history(max_items: int = 20) -> list[dict]:
         hist.append({"role": role, "content": content.strip()})
     return hist[-max_items:]
 
-# ------------------------------------------------------------
-# HELPER: Antwort robust extrahieren
-# ------------------------------------------------------------
+
 def extract_text(data) -> str:
     if isinstance(data, list) and data:
         data = data[0]
@@ -79,6 +81,7 @@ def extract_text(data) -> str:
 
     return ""
 
+
 def extract_debug(data) -> dict:
     if isinstance(data, list) and data:
         data = data[0]
@@ -94,6 +97,13 @@ def extract_debug(data) -> dict:
         "project_id": data.get("project_id"),
         "request_id": data.get("request_id"),
     }
+
+
+def reset_uploads():
+    st.session_state.frozen_images = []
+    st.session_state.frozen_pdf = None
+    st.session_state.uploader_key += 1
+
 
 # ------------------------------------------------------------
 # SIDEBAR
@@ -114,6 +124,19 @@ master_prompt = st.sidebar.text_area(
 
 debug_mode = st.sidebar.toggle("Debug anzeigen", value=False)
 
+st.sidebar.divider()
+col_a, col_b = st.sidebar.columns(2)
+with col_a:
+    if st.button("Anhänge leeren"):
+        reset_uploads()
+        st.rerun()
+with col_b:
+    if st.button("Chat leeren"):
+        st.session_state.messages = []
+        reset_uploads()
+        st.rerun()
+
+
 # ------------------------------------------------------------
 # HEADER
 # ------------------------------------------------------------
@@ -125,7 +148,6 @@ st.title("🧠 KI Cockpit")
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-
         if debug_mode and msg["role"] == "assistant":
             meta = msg.get("meta") or {}
             if meta:
@@ -133,12 +155,11 @@ for msg in st.session_state.messages:
                 st.json(meta)
 
 # ------------------------------------------------------------
-# INPUT-BEREICH (integriert)
+# INPUT-BEREICH
 # ------------------------------------------------------------
 st.divider()
 st.caption("📎 Anhänge (optional)")
 
-# Bilder (0–3)
 uploaded_images = st.file_uploader(
     "Bilder (max. 3)",
     type=["png", "jpg", "jpeg"],
@@ -147,7 +168,6 @@ uploaded_images = st.file_uploader(
     key=f"uploader_images_{st.session_state.uploader_key}",
 )
 
-# PDF (0–1)
 uploaded_pdf = st.file_uploader(
     "PDF (optional)",
     type=["pdf"],
@@ -156,7 +176,7 @@ uploaded_pdf = st.file_uploader(
     key=f"uploader_pdf_{st.session_state.uploader_key}",
 )
 
-# Vorschau direkt im Input-Bereich
+# Vorschau
 if uploaded_images:
     if len(uploaded_images) > 3:
         st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
@@ -170,7 +190,6 @@ if uploaded_images:
 if uploaded_pdf:
     st.caption(f"📄 {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
 
-# Chat Input ganz unten (bleibt Chat-typisch)
 prompt = st.chat_input("Deine Nachricht …")
 
 # ------------------------------------------------------------
@@ -178,10 +197,33 @@ prompt = st.chat_input("Deine Nachricht …")
 # ------------------------------------------------------------
 if prompt:
     request_id = str(uuid.uuid4())
-
     history = build_history(max_items=20)
 
     add_message("user", prompt)
+
+    # Anhänge "einfrieren" (damit sich zwischen Reruns nichts ändert)
+    frozen_images = []
+    if uploaded_images:
+        imgs = uploaded_images[:3]
+        for img in imgs:
+            img_bytes = img.getvalue()
+            frozen_images.append({
+                "filename": img.name,
+                "mime": img.type,
+                "b64": base64.b64encode(img_bytes).decode("utf-8"),
+            })
+
+    frozen_pdf = None
+    if uploaded_pdf:
+        pdf_bytes = uploaded_pdf.getvalue()
+        frozen_pdf = {
+            "filename": uploaded_pdf.name,
+            "mime": uploaded_pdf.type or "application/pdf",
+            "b64": base64.b64encode(pdf_bytes).decode("utf-8"),
+        }
+
+    st.session_state.frozen_images = frozen_images
+    st.session_state.frozen_pdf = frozen_pdf
 
     payload = {
         "request_id": request_id,
@@ -190,31 +232,9 @@ if prompt:
         "model": model,
         "master_prompt": master_prompt,
         "history": history,
-        "images": [],
-        "pdfs": [],
+        "images": st.session_state.frozen_images,
+        "pdfs": [st.session_state.frozen_pdf] if st.session_state.frozen_pdf else [],
     }
-
-    # Bilder
-    if uploaded_images:
-        if len(uploaded_images) > 3:
-            uploaded_images = uploaded_images[:3]
-
-        for img in uploaded_images:
-            img_bytes = img.getvalue()
-            payload["images"].append({
-                "filename": img.name,
-                "mime": img.type,
-                "b64": base64.b64encode(img_bytes).decode("utf-8"),
-            })
-
-    # PDF
-    if uploaded_pdf:
-        pdf_bytes = uploaded_pdf.getvalue()
-        payload["pdfs"].append({
-            "filename": uploaded_pdf.name,
-            "mime": uploaded_pdf.type or "application/pdf",
-            "b64": base64.b64encode(pdf_bytes).decode("utf-8"),
-        })
 
     # Rückwärtskompatibilität (alt)
     if payload["images"] and len(payload["images"]) == 1:
@@ -260,7 +280,7 @@ if st.session_state.pending_payload:
 
     add_message("assistant", answer, meta=meta)
 
-    # Uploads leeren
-    st.session_state.uploader_key += 1
+    # Uploads wirklich leeren
+    reset_uploads()
 
     st.rerun()
