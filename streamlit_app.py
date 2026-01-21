@@ -2,14 +2,15 @@ import streamlit as st
 import requests
 import base64
 import uuid
+from typing import Any
 
 # ------------------------------------------------------------
-# KONFIGURATION (Secrets aus Streamlit Cloud)
+# KONFIGURATION (Secrets)
 # ------------------------------------------------------------
 N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
-N8N_MODELS_URL  = st.secrets.get("N8N_MODELS_URL", "")
-N8N_BASIC_USER  = st.secrets["N8N_BASIC_USER"]
-N8N_BASIC_PASS  = st.secrets["N8N_BASIC_PASS"]
+N8N_MODELS_URL = st.secrets["N8N_MODELS_URL"]
+N8N_BASIC_USER = st.secrets["N8N_BASIC_USER"]
+N8N_BASIC_PASS = st.secrets["N8N_BASIC_PASS"]
 
 st.set_page_config(page_title="KI Cockpit", layout="wide")
 
@@ -25,24 +26,21 @@ if "pending_payload" not in st.session_state:
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
-# Freeze-Mechanik: Anhänge beim Senden "einfrieren"
+# Freeze-Mechanik: Anhänge beim Senden einfrieren
 if "frozen_images" not in st.session_state:
     st.session_state.frozen_images = []
 
 if "frozen_pdf" not in st.session_state:
     st.session_state.frozen_pdf = None
 
-# Model Catalog Cache
-if "models" not in st.session_state:
-    st.session_state.models = []  # Liste von dicts: {id,label,provider,cap}
+# Model-Catalog Cache
+if "models_cache" not in st.session_state:
+    st.session_state.models_cache = []  # list[dict]
 if "models_error" not in st.session_state:
-    st.session_state.models_error = None
-if "selected_model_key" not in st.session_state:
-    # key-Format: "provider::id"
-    st.session_state.selected_model_key = "openai::gpt-4o-mini"
+    st.session_state.models_error = None  # str|None
 
 # ------------------------------------------------------------
-# HELPER: Nachrichten sauber hinzufügen
+# HELPERS
 # ------------------------------------------------------------
 def add_message(role: str, content: str, meta: dict | None = None):
     st.session_state.messages = st.session_state.messages + [{
@@ -53,7 +51,7 @@ def add_message(role: str, content: str, meta: dict | None = None):
     }]
 
 def build_history(max_items: int = 20) -> list[dict]:
-    hist = []
+    hist: list[dict] = []
     for m in st.session_state.messages:
         role = m.get("role")
         content = m.get("content")
@@ -64,7 +62,7 @@ def build_history(max_items: int = 20) -> list[dict]:
         hist.append({"role": role, "content": content.strip()})
     return hist[-max_items:]
 
-def extract_text(data) -> str:
+def extract_text(data: Any) -> str:
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
@@ -88,7 +86,7 @@ def extract_text(data) -> str:
 
     return ""
 
-def extract_debug(data) -> dict:
+def extract_debug(data: Any) -> dict:
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
@@ -109,135 +107,112 @@ def reset_uploads():
     st.session_state.frozen_pdf = None
     st.session_state.uploader_key += 1
 
-# ------------------------------------------------------------
-# MODELS: Laden + Validieren
-# ------------------------------------------------------------
-def default_models() -> list[dict]:
-    # Fallback, falls Models-Endpunkt nicht erreichbar ist.
-    return [
-        {"id": "gpt-4o-mini", "label": "OpenAI · gpt-4o-mini", "provider": "openai", "cap": ["text", "vision", "pdf_text"]},
-        {"id": "gpt-4.1", "label": "OpenAI · gpt-4.1", "provider": "openai", "cap": ["text"]},
-        {"id": "gemini-1.5-flash", "label": "Gemini · 1.5 Flash", "provider": "gemini", "cap": ["text", "vision", "pdf_text"]},
-    ]
+def model_key(m: dict) -> str:
+    # eindeutiger Key
+    return f"{m.get('provider','')}:{m.get('id','')}".strip(":")
+
+def parse_model_key(k: str) -> tuple[str, str]:
+    # "openai:gpt-4o-mini" -> ("openai","gpt-4o-mini")
+    if not isinstance(k, str) or ":" not in k:
+        return ("openai", "gpt-4o-mini")
+    provider, mid = k.split(":", 1)
+    provider = (provider or "openai").strip().lower()
+    mid = (mid or "gpt-4o-mini").strip()
+    return provider, mid
 
 def load_models():
     st.session_state.models_error = None
-
-    if not N8N_MODELS_URL:
-        st.session_state.models = default_models()
-        st.session_state.models_error = "N8N_MODELS_URL fehlt in den Secrets. Fallback-Modelle aktiv."
-        return
-
     try:
         r = requests.get(
             N8N_MODELS_URL,
             auth=(N8N_BASIC_USER, N8N_BASIC_PASS),
-            timeout=20,
+            timeout=30,
             headers={"Accept": "application/json"},
         )
-        if r.status_code != 200:
-            st.session_state.models = default_models()
-            st.session_state.models_error = f"Models konnten nicht geladen werden: HTTP {r.status_code}"
-            return
-
+        r.raise_for_status()
         data = r.json()
-        models = data.get("models")
-        if not isinstance(models, list) or not models:
-            st.session_state.models = default_models()
-            st.session_state.models_error = "Models-Endpunkt lieferte keine Liste. Fallback-Modelle aktiv."
-            return
-
-        # sanitisieren
+        # n8n liefert: {"models":[...]}  (oder manchmal [{ "models": [...] }])
+        if isinstance(data, list) and data:
+            data = data[0]
+        models = []
+        if isinstance(data, dict):
+            models = data.get("models") or []
+        if not isinstance(models, list):
+            models = []
+        # minimale Validierung
         cleaned = []
         for m in models:
             if not isinstance(m, dict):
                 continue
-            mid = m.get("id")
-            provider = m.get("provider")
-            label = m.get("label") or f"{provider} · {mid}"
-            cap = m.get("cap") or []
-            if isinstance(mid, str) and mid and isinstance(provider, str) and provider:
-                cleaned.append({"id": mid, "provider": provider, "label": label, "cap": cap})
-
-        if not cleaned:
-            st.session_state.models = default_models()
-            st.session_state.models_error = "Models-Endpunkt lieferte ungültige Daten. Fallback-Modelle aktiv."
-            return
-
-        st.session_state.models = cleaned
-
+            if not m.get("id") or not m.get("provider") or not m.get("label"):
+                continue
+            cleaned.append(m)
+        st.session_state.models_cache = cleaned
     except Exception as e:
-        st.session_state.models = default_models()
-        st.session_state.models_error = f"Models konnten nicht geladen werden ({type(e).__name__}). Fallback-Modelle aktiv."
-
-def ensure_selected_model_valid():
-    keys = {f'{m["provider"]}::{m["id"]}' for m in st.session_state.models}
-    if st.session_state.selected_model_key not in keys:
-        # Fallback auf erstes Modell
-        st.session_state.selected_model_key = next(iter(keys))
-
-# Beim ersten Start einmal laden
-if not st.session_state.models:
-    load_models()
-ensure_selected_model_valid()
+        st.session_state.models_cache = []
+        st.session_state.models_error = str(e)
 
 # ------------------------------------------------------------
 # SIDEBAR
 # ------------------------------------------------------------
 st.sidebar.title("Projekte")
-project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 
+project = st.sidebar.text_input("Projektname", value="Neues Projekt")
 debug_mode = st.sidebar.toggle("Debug anzeigen", value=False)
 
-# Models-Panel
+st.sidebar.divider()
+
 with st.sidebar.expander("Modelle", expanded=True):
-    col_a, col_b = st.columns([1, 1])
+    col_a, col_b = st.columns([1, 2], vertical_alignment="center")
     with col_a:
-        if st.button("Aktualisieren", use_container_width=True):
+        if st.button("Aktualisieren"):
             load_models()
-            ensure_selected_model_valid()
-            st.rerun()
     with col_b:
-        st.caption(f"{len(st.session_state.models)} Modelle")
+        st.caption(f"{len(st.session_state.models_cache)} Modelle")
 
     if st.session_state.models_error:
-        st.error(st.session_state.models_error)
+        st.error(f"Modelle konnten nicht geladen werden: {st.session_state.models_error}")
 
-# Dropdown: Labels anzeigen, aber Key sauber mappen
-model_options = {f'{m["provider"]}::{m["id"]}': m for m in st.session_state.models}
-model_labels = [model_options[k]["label"] for k in model_options.keys()]
-model_keys   = list(model_options.keys())
+# Wenn noch keine Modelle geladen: einmalig versuchen (ohne Polling-Schleife)
+# Nur beim ersten Start, nicht bei jedem Rerun.
+if not st.session_state.models_cache and st.session_state.models_error is None:
+    load_models()
 
-# Index bestimmen ohne KeyError
-try:
-    current_index = model_keys.index(st.session_state.selected_model_key)
-except ValueError:
-    current_index = 0
-    st.session_state.selected_model_key = model_keys[0]
+# Dropdown: Werte sind model_key, Anzeige kommt aus label
+models = st.session_state.models_cache
+model_options = [model_key(m) for m in models] if models else ["openai:gpt-4o-mini"]
 
-selected_label = st.sidebar.selectbox(
+# Label-Mapping für format_func
+label_map = {model_key(m): m.get("label", model_key(m)) for m in models}
+def format_model(k: str) -> str:
+    return label_map.get(k, k)
+
+# Default Auswahl stabil halten
+if "selected_model_key" not in st.session_state:
+    st.session_state.selected_model_key = model_options[0] if model_options else "openai:gpt-4o-mini"
+
+selected_model_key = st.sidebar.selectbox(
     "KI-Modell",
-    model_labels,
-    index=current_index,
+    options=model_options,
+    index=model_options.index(st.session_state.selected_model_key) if st.session_state.selected_model_key in model_options else 0,
+    format_func=format_model,
 )
 
-# Rück-mappen (Label → Key) stabil via Index
-selected_index = model_labels.index(selected_label)
-st.session_state.selected_model_key = model_keys[selected_index]
-selected_model = model_options[st.session_state.selected_model_key]
+st.session_state.selected_model_key = selected_model_key
+routing_provider, routing_model = parse_model_key(selected_model_key)
 
 master_prompt = st.sidebar.text_area(
     "Master-Plan",
-    value="Antworte kurz und bündig.",
+    value="Analysiere das Bild professionell.",
 )
 
 st.sidebar.divider()
-col_a, col_b = st.sidebar.columns(2)
-with col_a:
+col1, col2 = st.sidebar.columns(2)
+with col1:
     if st.button("Anhänge leeren"):
         reset_uploads()
         st.rerun()
-with col_b:
+with col2:
     if st.button("Chat leeren"):
         st.session_state.messages = []
         reset_uploads()
@@ -282,8 +257,7 @@ uploaded_pdf = st.file_uploader(
     key=f"uploader_pdf_{st.session_state.uploader_key}",
 )
 
-# Vorschau (kleiner)
-preview_size = 140  # px
+# Vorschau (kleiner darstellen)
 if uploaded_images:
     if len(uploaded_images) > 3:
         st.warning("⚠️ Maximal 3 Bilder erlaubt. Es werden nur die ersten 3 verwendet.")
@@ -292,8 +266,8 @@ if uploaded_images:
     cols = st.columns(min(3, len(uploaded_images)))
     for i, img in enumerate(uploaded_images):
         with cols[i % len(cols)]:
-            # use_container_width=False + width=... ergibt echte Miniaturen
-            st.image(img, caption=img.name, width=preview_size)
+            # deutlich kleinere Vorschau:
+            st.image(img, caption=img.name, width=180)
 
 if uploaded_pdf:
     st.caption(f"📄 {uploaded_pdf.name} ({uploaded_pdf.size / 1024:.1f} KB)")
@@ -309,7 +283,7 @@ if prompt:
 
     add_message("user", prompt)
 
-    # Anhänge "einfrieren"
+    # Anhänge einfrieren
     frozen_images = []
     if uploaded_images:
         imgs = uploaded_images[:3]
@@ -337,9 +311,14 @@ if prompt:
         "request_id": request_id,
         "message": prompt,
         "project": project,
-        # Für Backend: model id + provider separat senden
-        "provider": selected_model["provider"],
-        "model": selected_model["id"],
+
+        # NEU: eindeutiges Routing
+        "routing": {
+            "provider": routing_provider,
+            "model": routing_model,
+            "label": format_model(selected_model_key),
+        },
+
         "master_prompt": master_prompt,
         "history": history,
         "images": st.session_state.frozen_images,
