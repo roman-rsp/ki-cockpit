@@ -203,7 +203,7 @@ routing_provider, routing_model = parse_model_key(selected_model_key)
 
 master_prompt = st.sidebar.text_area(
     "Master-Plan",
-    value="Analysiere das Bild professionell.",
+    value="Antworte kurz und bündig",
 )
 
 st.sidebar.divider()
